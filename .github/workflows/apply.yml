@@ -1,0 +1,37 @@
+name: DNS Apply
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "dnsconfig.js"
+      - "creds.json"
+      - ".github/workflows/apply.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    # No Environment approval gate: solo project, so a required-reviewer step
+    # would just block on self-approval. The PR review + preview check before
+    # merge is the checkpoint instead.
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN_WRITE }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dnscontrol
+        env:
+          DNSCONTROL_VERSION: "4.46.0"
+        run: |
+          curl -sSL "https://github.com/DNSControl/dnscontrol/releases/download/v${DNSCONTROL_VERSION}/dnscontrol_${DNSCONTROL_VERSION}_linux_amd64.tar.gz" \
+            | tar -xz dnscontrol
+          sudo mv dnscontrol /usr/local/bin/dnscontrol
+          dnscontrol version
+
+      - name: Run dnscontrol push
+        run: dnscontrol push
