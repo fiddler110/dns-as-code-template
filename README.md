@@ -38,3 +38,7 @@ python scripts/dnsctl.py doctor
 ```
 
 See [docs/getting-started.md](docs/getting-started.md) for the full setup, including creating the Cloudflare API tokens and GitHub secrets.
+
+## License
+
+[MIT](LICENSE)
