@@ -8,6 +8,8 @@ DNS records for every zone this project manages — currently `example.com` and 
 - GitHub Actions runs `dnscontrol preview` on every PR and posts the exact diff as a comment — no one has to guess what a change will do before it's reviewed.
 - Merging to `main` triggers `dnscontrol push`, which applies the change to Cloudflare using a separate, write-scoped token.
 
+**Note:** in this template, both `.github/workflows/preview.yml` and `apply.yml` have their triggers commented out (`on: {}`) — they'd just fail with no real zone or credentials configured. Once you've replaced the example zones in `dnsconfig.js` and set up the two Cloudflare API token secrets (below), uncomment the `on:` block in each workflow file to turn them back on.
+
 ## Prerequisites
 
 - [Go](https://go.dev/) (to install dnscontrol) — or download a prebuilt binary from the [dnscontrol releases page](https://github.com/DNSControl/dnscontrol/releases) instead.
