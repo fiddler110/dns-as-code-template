@@ -1,13 +1,20 @@
 name: DNS Apply
 
-on:
-  push:
-    branches:
-      - main
-    paths:
-      - "dnsconfig.js"
-      - "creds.json"
-      - ".github/workflows/apply.yml"
+# Triggers are commented out in this template - it has no real Cloudflare
+# credentials, so a triggered run would just fail. Uncomment the `on:` block
+# below (and remove the `on: {}` placeholder) once you've replaced the
+# example zones in dnsconfig.js and set up the CLOUDFLARE_API_TOKEN_WRITE
+# secret - see docs/getting-started.md and docs/branch-protection-and-secrets.md.
+#
+# on:
+#   push:
+#     branches:
+#       - main
+#     paths:
+#       - "dnsconfig.js"
+#       - "creds.json"
+#       - ".github/workflows/apply.yml"
+on: {}
 
 permissions:
   contents: read
