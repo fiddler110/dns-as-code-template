@@ -10,6 +10,7 @@ This project manages DNS for `example.com` and `example.org` as code, using [dns
 | [ci-cd-pipeline.md](ci-cd-pipeline.md) | You want to understand exactly what the GitHub Actions workflows do and why. |
 | [operations.md](operations.md) | You're rotating tokens, re-importing the zone, recovering from a mistake, or debugging a failure. |
 | [security.md](security.md) | You want the threat model and reasoning behind the security choices in this repo. |
+| [branch-protection-and-secrets.md](branch-protection-and-secrets.md) | You're setting up GitHub secrets and branch protection for real (or the Azure DevOps equivalent), not just reading about the reasoning. |
 | [dnsctl-cli.md](dnsctl-cli.md) | You want to use `scripts/dnsctl.py`, the cross-platform helper script, instead of running dnscontrol commands by hand. |
 
 ## The one-sentence version

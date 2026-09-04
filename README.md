@@ -24,6 +24,7 @@ Full docs live in [`docs/`](docs/README.md):
 - [CI/CD pipeline](docs/ci-cd-pipeline.md) — what the GitHub Actions workflows and the local pre-push hook actually do.
 - [Operations](docs/operations.md) — token rotation, re-baselining the zone, recovering from mistakes, troubleshooting.
 - [Security model](docs/security.md) — threat model and the reasoning behind the security choices here.
+- [Branch protection & secrets](docs/branch-protection-and-secrets.md) — securely configuring GitHub secrets/branch protection, plus the Azure DevOps equivalent.
 - [dnsctl CLI](docs/dnsctl-cli.md) — `scripts/dnsctl.py`, a cross-platform (Windows/macOS/Linux) helper script for common operations.
 
 ## Quick start
