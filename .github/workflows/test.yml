@@ -1,0 +1,45 @@
+name: Python Tests
+
+# Broader than preview.yml's dnsconfig.js-only filter on purpose: lint and the
+# test suite need to run whenever scripts/dnsctl.py itself changes, which is
+# exactly when they're most likely to catch something.
+on:
+  push:
+    paths:
+      - "dnsconfig.js"
+      - "scripts/**"
+      - "tests/**"
+      - ".github/workflows/test.yml"
+  pull_request:
+    paths:
+      - "dnsconfig.js"
+      - "scripts/**"
+      - "tests/**"
+      - ".github/workflows/test.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Run dnsctl lint
+        run: python scripts/dnsctl.py lint
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Install test dependencies
+        run: pip install pytest
+      - name: Run test suite
+        run: pytest tests/ -v
