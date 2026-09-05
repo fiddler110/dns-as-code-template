@@ -64,6 +64,40 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+# Needed so `import dnsctl_lib` resolves whether dnsctl.py is run directly
+# (python scripts/dnsctl.py ...) or loaded by file path, as the test suite
+# does - neither guarantees scripts/ is already on sys.path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from dnsctl_lib import install, procutil, records, render  # noqa: E402
+from dnsctl_lib import env as env_lib  # noqa: E402
+from dnsctl_lib.env import load_env_file  # noqa: E402
+from dnsctl_lib.cli_utils import (  # noqa: E402
+    eprint,
+    parse_index_arg,
+    prompt,
+    prompt_yes_no,
+    slugify,
+)
+from dnsctl_lib.procutil import (  # noqa: E402
+    exe_name,
+    find_dnscontrol,
+    git,
+    git_output,
+    gh,
+    have_gh,
+    require_gh,
+    run_dnscontrol,
+)
+from dnsctl_lib.records import (  # noqa: E402
+    RECORD_LINE_PATTERN,
+    build_record_line,
+    classify_zone_line,
+    fqdn_for,
+    parse_record_line_full,
+    split_top_level_args,
+)
+
 # Keep in sync with DNSCONTROL_VERSION in .github/workflows/preview.yml and apply.yml.
 DNSCONTROL_VERSION = "4.46.0"
 CREDKEY = "cloudflare"
@@ -72,450 +106,32 @@ CREDKEY = "cloudflare"
 # name belongs to (and to require --zone when a bare relative name is ambiguous).
 ZONES = ["example.com", "example.org"]
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = procutil.REPO_ROOT
 ENV_FILE = REPO_ROOT / ".env"
 ENV_EXAMPLE = REPO_ROOT / ".env.example"
 CREDS_FILE = REPO_ROOT / "creds.json"
 DNSCONFIG_FILE = REPO_ROOT / "dnsconfig.js"
 
 
-def eprint(*args, **kwargs):
-    print(*args, file=sys.stderr, **kwargs)
-
-
-def load_env_file(path: Path) -> dict:
-    """Minimal KEY=VALUE .env parser. No external dependency required."""
-    env = {}
-    if not path.is_file():
-        return env
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        if key:
-            env[key] = value
-    return env
-
-
-def fetch_keyvault_secret(vault: str, secret_name: str) -> str | None:
-    """Fetch a secret's current value from Azure Key Vault via the Azure CLI.
-
-    Shells out to `az` rather than adding the azure-keyvault-secrets/azure-identity
-    SDKs as a dependency - this project is deliberately Python-stdlib-only (see
-    CLAUDE.md), and `az` is just another external tool in the same category as
-    `gh`/`dnscontrol`. Returns None (with a warning on stderr) on any failure so
-    callers can fall back to .env/the environment instead of hard-erroring."""
-    az = shutil.which("az")
-    if not az:
-        eprint(
-            "warning: Azure CLI ('az') not found on PATH - can't fetch "
-            f"'{secret_name}' from Key Vault '{vault}'. Install it: "
-            "https://learn.microsoft.com/cli/azure/install-azure-cli"
-        )
-        return None
-    result = subprocess.run(
-        [az, "keyvault", "secret", "show", "--vault-name", vault,
-         "--name", secret_name, "--query", "value", "-o", "tsv"],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        stderr = result.stderr.strip()
-        eprint(
-            f"warning: could not fetch secret '{secret_name}' from Key Vault "
-            f"'{vault}'{f' ({stderr})' if stderr else ''}. Run 'az login' if you "
-            "haven't authenticated, and confirm you have the 'Key Vault Secrets "
-            "User' role on this vault."
-        )
-        return None
-    token = result.stdout.strip()
-    return token or None
-
-
 def load_cloudflare_env(env_file: Path = ENV_FILE) -> dict:
-    """Load the local .env, then - if CLOUDFLARE_API_TOKEN isn't already set
-    there or in the environment - fetch it from Azure Key Vault when a vault
-    is configured (CLOUDFLARE_KEYVAULT_NAME, optionally CLOUDFLARE_KEYVAULT_SECRET_NAME
-    in .env or the environment). The fetched value is only ever held in this
-    in-memory dict for the current process/subprocess call - never written to
-    .env or disk anywhere. .env/the environment take priority and are the only
-    thing consulted if no vault is configured, so a solo operator who hasn't
-    set one up sees no change in behavior. See docs/security.md#key-vault-backed-tokens."""
-    env = load_env_file(env_file)
-    if "CLOUDFLARE_API_TOKEN" in env or "CLOUDFLARE_API_TOKEN" in os.environ:
-        return env
-
-    vault = env.get("CLOUDFLARE_KEYVAULT_NAME") or os.environ.get("CLOUDFLARE_KEYVAULT_NAME")
-    if not vault:
-        return env
-
-    secret_name = (
-        env.get("CLOUDFLARE_KEYVAULT_SECRET_NAME")
-        or os.environ.get("CLOUDFLARE_KEYVAULT_SECRET_NAME")
-        or "cloudflare-api-token-readonly"
-    )
-    print(
-        f"No local CLOUDFLARE_API_TOKEN - fetching from Key Vault '{vault}' "
-        f"(secret '{secret_name}')...",
-        file=sys.stderr,
-    )
-    token = fetch_keyvault_secret(vault, secret_name)
-    if token:
-        env["CLOUDFLARE_API_TOKEN"] = token
-    return env
-
-
-def find_dnscontrol() -> str | None:
-    found = shutil.which("dnscontrol")
-    if found:
-        return found
-    # go install puts binaries in $GOBIN or $GOPATH/bin, which may not be on
-    # PATH yet in this shell session - check the common locations directly.
-    candidates = []
-    gopath = os.environ.get("GOPATH")
-    home = Path.home()
-    if gopath:
-        candidates.append(Path(gopath) / "bin" / exe_name("dnscontrol"))
-    candidates.append(home / "go" / "bin" / exe_name("dnscontrol"))
-    for candidate in candidates:
-        if candidate.is_file():
-            return str(candidate)
-    return None
-
-
-def exe_name(name: str) -> str:
-    return f"{name}.exe" if platform.system() == "Windows" else name
-
-
-def run_dnscontrol(args: list[str], env_overrides: dict) -> int:
-    dnscontrol = find_dnscontrol()
-    if not dnscontrol:
-        eprint(
-            "error: dnscontrol not found on PATH.\n"
-            "  Run: python scripts/dnsctl.py install-dnscontrol\n"
-            "  or:  go install github.com/DNSControl/dnscontrol/v4@latest"
-        )
-        return 1
-
-    env = os.environ.copy()
-    env.update(env_overrides)
-
-    proc = subprocess.run([dnscontrol, *args], cwd=REPO_ROOT, env=env)
-    return proc.returncode
-
-
-def have_gh() -> bool:
-    return shutil.which("gh") is not None
-
-
-def require_gh() -> bool:
-    if have_gh():
-        return True
-    eprint("error: GitHub CLI ('gh') not found on PATH. Install it: https://cli.github.com/")
-    return False
-
-
-def git(args: list[str], capture: bool = False) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["git", *args], cwd=REPO_ROOT, capture_output=capture, text=capture
-    )
-
-
-def git_output(args: list[str]) -> str:
-    return git(args, capture=True).stdout.strip()
-
-
-def gh(args: list[str], capture: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["gh", *args], cwd=REPO_ROOT, capture_output=capture, text=capture
-    )
-
-
-def slugify(text: str, max_len: int = 40) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
-    return (slug[:max_len].rstrip("-")) or "change"
-
-
-def parse_index_arg(text: str) -> list[int]:
-    """Parse one --remove token: a plain int ("3"), a range ("1-6"), or
-    comma-separated combos of either ("1,2,4-6"). Returns the expanded ints."""
-    result = []
-    for part in text.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        m = re.fullmatch(r"(\d+)-(\d+)", part)
-        if m:
-            lo, hi = int(m.group(1)), int(m.group(2))
-            if lo > hi:
-                lo, hi = hi, lo
-            result.extend(range(lo, hi + 1))
-            continue
-        if not re.fullmatch(r"\d+", part):
-            raise argparse.ArgumentTypeError(
-                f"invalid index or range: {part!r} (expected an integer like '3' or a range like '1-6')"
-            )
-        result.append(int(part))
-    return result
-
-
-def prompt(message: str, default: str | None = None) -> str:
-    suffix = f" [{default}]" if default is not None else ""
-    value = input(f"{message}{suffix}: ").strip()
-    return value or (default or "")
-
-
-def prompt_yes_no(message: str, default_yes: bool = True) -> bool:
-    suffix = " [Y/n]" if default_yes else " [y/N]"
-    answer = input(f"{message}{suffix}: ").strip().lower()
-    if not answer:
-        return default_yes
-    return answer == "y"
-
-
-# A record name is either "@" (apex), "*" (wildcard), or dot-separated labels
-# made of letters/digits/hyphen/underscore (each label non-empty, no leading/
-# trailing hyphen requirement enforced - Cloudflare/dnscontrol will reject
-# anything actually invalid at preview time regardless).
-VALID_NAME_PATTERN = re.compile(r'^(\*|[A-Za-z0-9_](?:[A-Za-z0-9_-]*[A-Za-z0-9_])?)'
-                                 r'(\.[A-Za-z0-9_](?:[A-Za-z0-9_-]*[A-Za-z0-9_])?)*$')
+    return env_lib.load_cloudflare_env(env_file)
 
 
 def detect_zone(spec: str) -> str | None:
     """Return the zone from ZONES that `spec` is fully-qualified under, if any."""
-    lower_spec = spec.strip().rstrip(".").lower()
-    for z in ZONES:
-        lz = z.lower()
-        if lower_spec == lz or lower_spec.endswith("." + lz):
-            return z
-    return None
+    return records.detect_zone(spec, ZONES)
 
 
 def parse_record_target(spec: str, zone: str | None = None) -> tuple[str, str]:
-    """
-    Parse an input like "plex.example.com", "www.plex.example.com",
-    "example.com" (apex), "*.example.com" (wildcard), or an
-    already-relative name like "plex" or "www.plex", into (name, zone) -
-    name is what dnscontrol expects ("@" for the apex), zone is one of ZONES.
-    Case-insensitive; tolerates a trailing dot on a fully-qualified name.
-
-    If `zone` is given, it's used directly (and validated against ZONES) -
-    required for a bare relative name when more than one zone is managed,
-    since e.g. "plex" alone doesn't say which zone it belongs to.
-    """
-    spec = spec.strip().rstrip(".")
-    if not spec:
-        raise ValueError("record name cannot be empty.")
-    lower_spec = spec.lower()
-
-    if zone:
-        if zone not in ZONES:
-            raise ValueError(f"'{zone}' is not a zone this project manages ({', '.join(ZONES)}).")
-        target_zone = zone
-    else:
-        target_zone = detect_zone(spec)
-        if target_zone is None:
-            if "." not in lower_spec:
-                raise ValueError(
-                    f"'{spec}' is a bare relative name, and this project manages more than "
-                    f"one zone ({', '.join(ZONES)}) - pass --zone to say which one."
-                )
-            raise ValueError(
-                f"'{spec}' doesn't match any zone this project manages ({', '.join(ZONES)})."
-            )
-
-    lower_zone = target_zone.lower()
-    if lower_spec == lower_zone:
-        name = "@"
-    else:
-        suffix = "." + lower_zone
-        if lower_spec.endswith(suffix):
-            name = spec[: -len(suffix)].lower()
-            name = name or "@"
-        else:
-            # No zone suffix present - the caller pinned the zone via --zone,
-            # so treat the whole spec as an already-relative name (e.g. "plex"
-            # or the compound "www.plex").
-            name = lower_spec
-
-    if name != "@" and not VALID_NAME_PATTERN.match(name):
-        raise ValueError(
-            f"'{name}' doesn't look like a valid DNS label/name "
-            "(letters, digits, hyphens, underscores, and dots only)."
-        )
-    return name, target_zone
-
-
-def fqdn_for(name: str, zone: str) -> str:
-    return zone if name == "@" else f"{name}.{zone}"
-
-
-# Only actual record-type functions - deliberately excludes D(...) (the domain
-# declaration itself), which would otherwise match "D(" as a one-letter type.
-KNOWN_RECORD_TYPES = ("A", "AAAA", "CNAME", "MX", "TXT", "NS", "CAA", "SRV", "PTR", "ALIAS")
-RECORD_LINE_PATTERN = re.compile(
-    r'^\s*(' + "|".join(KNOWN_RECORD_TYPES) + r')\(\s*"((?:[^"\\]|\\.)*)"'
-)
-FULL_RECORD_LINE_PATTERN = re.compile(
-    r'^\s*(' + "|".join(KNOWN_RECORD_TYPES) + r')\((.*)\),?\s*(//.*)?$'
-)
-# For these record types, only this many positional args (after name) are
-# meaningful (MX: priority + value, everything else: value). Anything beyond
-# that - an unrecognized modifier call, say - is preserved verbatim in
-# `extras` instead of being silently absorbed into the record's value.
-EXPECTED_POSITIONAL_COUNT = {"A": 1, "CNAME": 1, "TXT": 1, "MX": 2}
-# Non-record lines that are expected inside a D(...) block besides records
-# themselves - anything else gets flagged by classify_zone_line() below
-# instead of being silently skipped.
-DIRECTIVE_LINE_PATTERN = re.compile(r'^\s*(DnsProvider|DefaultTTL)\(')
-
-
-def split_top_level_args(argstr: str) -> list[str]:
-    """Split a call's argument text on top-level commas (ignores commas
-    inside quoted strings or nested parens like TTL(120))."""
-    args = []
-    cur = []
-    depth = 0
-    in_str = False
-    escape = False
-    for ch in argstr:
-        if in_str:
-            cur.append(ch)
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == '"':
-                in_str = False
-            continue
-        if ch == '"':
-            in_str = True
-            cur.append(ch)
-        elif ch == "(":
-            depth += 1
-            cur.append(ch)
-        elif ch == ")":
-            depth -= 1
-            cur.append(ch)
-        elif ch == "," and depth == 0:
-            args.append("".join(cur).strip())
-            cur = []
-        else:
-            cur.append(ch)
-    if "".join(cur).strip():
-        args.append("".join(cur).strip())
-    return args
-
-
-def parse_record_line_full(line: str) -> dict | None:
-    """Parse one record line into its constituent fields for reporting.
-
-    Best-effort: covers the modifiers actually used in this project
-    (CF_PROXY_ON/OFF, TTL(n)) plus positional name/value(s)/MX priority.
-    """
-    m = FULL_RECORD_LINE_PATTERN.match(line)
-    if not m:
-        return None
-    record_type, argstr, trailing_comment = m.group(1), m.group(2), m.group(3)
-    raw_args = split_top_level_args(argstr)
-    if not raw_args:
-        return None
-
-    def unquote(a: str) -> str:
-        if a.startswith('"'):
-            try:
-                return json.loads(a)
-            except (json.JSONDecodeError, ValueError):
-                return a.strip('"')
-        return a
-
-    proxied = ""
-    ttl = ""
-    positional = []
-    extras = []
-    expected = EXPECTED_POSITIONAL_COUNT.get(record_type)
-    for a in raw_args[1:]:
-        if a == "CF_PROXY_ON":
-            proxied = "yes"
-        elif a == "CF_PROXY_OFF":
-            proxied = "no"
-        elif a.startswith("TTL(") and a.endswith(")"):
-            ttl = a[len("TTL("):-1].strip()
-        elif expected is None or len(positional) < expected:
-            positional.append(a)
-        else:
-            # An unsupported modifier or extra argument this parser doesn't
-            # model - keep the raw token so a rewrite can preserve it
-            # instead of mashing it into the value (see ROADMAP.md TOOL-2).
-            extras.append(a)
-
-    name = unquote(raw_args[0])
-    priority = ""
-    if record_type == "MX" and positional:
-        priority = positional.pop(0)
-    value_parts = [unquote(p) for p in positional]
-    value = " ".join(value_parts)
-
-    return {
-        "type": record_type,
-        "name": name,
-        "value": value,
-        "priority": priority,
-        "ttl": ttl,
-        "proxied": proxied,
-        "extras": extras,
-        "comment": (trailing_comment or "").strip(),
-        "raw": line.strip(),
-    }
-
-
-def classify_zone_line(line: str) -> tuple[dict | None, str | None]:
-    """Classify one line inside a D(...) zone block for `lint` and `show`.
-
-    Returns (parsed, skip_reason): `parsed` is the dict from
-    parse_record_line_full() for a record line, `skip_reason` is a
-    human-readable string for anything that isn't a record and isn't one of
-    the expected non-record directives - callers should surface this rather
-    than silently skip it (that silent skip was the TOOL-1 bug: `show`/`lint`
-    used to disagree with `record list` about how many records exist).
-    Both are None for a blank line, a `//` comment, or a recognised directive
-    (DnsProvider/DefaultTTL) - there's nothing to report for those.
-    """
-    raw = line.strip()
-    if not raw or raw.startswith("//") or DIRECTIVE_LINE_PATTERN.match(raw):
-        return None, None
-    parsed = parse_record_line_full(line)
-    if parsed:
-        return parsed, None
-    if RECORD_LINE_PATTERN.match(line):
-        return None, "looks like a record call but could not be fully parsed (unsupported modifier, multi-line call, or syntax dnsctl doesn't understand yet)"
-    return None, "is not a recognised directive or record"
-
-
-def find_zone_block_in_lines(lines: list[str], zone: str, source_name: str = "the file") -> tuple[int, int]:
-    """Return (start, end) line indices of D("zone", ...) ... ); within arbitrary
-    dnscontrol-JS source lines - shared by find_zone_block (dnsconfig.js) and
-    anything parsing a `get-zones` snapshot of live state."""
-    start = None
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped.startswith(f'D("{zone}"') or stripped.startswith(f"D('{zone}'"):
-            start = i
-            break
-    if start is None:
-        raise RuntimeError(f'Could not find D("{zone}", ...) in {source_name}.')
-    for j in range(start + 1, len(lines)):
-        if lines[j].strip() == ");":
-            return start, j
-    raise RuntimeError(f'Could not find the closing ");" for zone {zone} in {source_name}.')
+    """Resolve `spec` (optionally pinned to `zone`) against ZONES - see
+    dnsctl_lib.records.parse_record_target for the full docstring."""
+    return records.parse_record_target(spec, ZONES, zone=zone)
 
 
 def find_zone_block(zone: str) -> tuple[int, int]:
     """Return (start, end) line indices of D("zone", ...) ... ); in dnsconfig.js."""
     lines = DNSCONFIG_FILE.read_text(encoding="utf-8").splitlines()
-    return find_zone_block_in_lines(lines, zone, source_name=DNSCONFIG_FILE.name)
+    return records.find_zone_block_in_lines(lines, zone, source_name=DNSCONFIG_FILE.name)
 
 
 def fetch_live_acme_snapshot(zone: str, env: dict) -> list[dict] | None:
@@ -571,57 +187,6 @@ def local_acme_entries(zone: str) -> list[tuple[int, str, dict]]:
         ):
             out.append((i, lines[i], parsed))
     return out
-
-
-def build_record_line(
-    record_type: str,
-    name: str,
-    value: str,
-    priority: int | None = None,
-    proxy: bool | None = None,
-    ttl: int | None = None,
-    proxy_off: bool = False,
-    extras: list[str] | None = None,
-    comment: str = "",
-) -> str:
-    quoted_name = json.dumps(name)
-    quoted_value = json.dumps(value)
-    extras = extras or []
-
-    def finish(parts: list[str]) -> str:
-        parts = parts + extras
-        line = f'\t{record_type}({", ".join(parts)}),'
-        if comment:
-            line += f"  {comment}" if comment.startswith("//") else f"  // {comment}"
-        return line
-
-    if record_type in ("A", "CNAME"):
-        parts = [quoted_name, quoted_value]
-        if proxy:
-            parts.append("CF_PROXY_ON")
-        elif proxy_off:
-            # Preserve an explicit CF_PROXY_OFF that was already on the line
-            # rather than silently normalising it away (see ROADMAP.md TOOL-2).
-            parts.append("CF_PROXY_OFF")
-        if ttl:
-            parts.append(f"TTL({ttl})")
-        return finish(parts)
-
-    if record_type == "MX":
-        if priority is None:
-            raise ValueError("MX records require a priority.")
-        return finish([quoted_name, str(priority), quoted_value])
-
-    if record_type == "TXT":
-        parts = [quoted_name, quoted_value]
-        if ttl:
-            parts.append(f"TTL({ttl})")
-        return finish(parts)
-
-    raise ValueError(
-        f"The record wizard doesn't support {record_type} records yet - "
-        "edit dnsconfig.js directly for this type. See docs/record-types.md."
-    )
 
 
 def find_record_lines(
@@ -808,32 +373,9 @@ def cmd_setup(_args) -> int:
     return 0
 
 
-def platform_asset_name(version: str) -> str | None:
-    system = platform.system()
-    machine = platform.machine().lower()
-
-    arch_map = {
-        "x86_64": "amd64",
-        "amd64": "amd64",
-        "arm64": "arm64",
-        "aarch64": "arm64",
-    }
-    arch = arch_map.get(machine)
-    if not arch:
-        return None
-
-    if system == "Linux":
-        return f"dnscontrol_{version}_linux_{arch}.tar.gz"
-    if system == "Darwin":
-        return f"dnscontrol_{version}_darwin_all.tar.gz"
-    if system == "Windows":
-        return f"dnscontrol_{version}_windows_{arch}.zip"
-    return None
-
-
 def cmd_install_dnscontrol(args) -> int:
     version = args.version
-    asset = platform_asset_name(version)
+    asset = install.platform_asset_name(version)
     if not asset:
         eprint(
             f"error: no known dnscontrol release asset for {platform.system()} "
@@ -2258,9 +1800,6 @@ def cmd_lint(args) -> int:
     return 1 if errors else 0
 
 
-SHOW_HEADERS = ["Zone", "Type", "Name", "FQDN", "Value", "Priority", "TTL", "Proxied"]
-
-
 def collect_show_rows(zone_filter: str | None) -> tuple[list[list[str]], list[tuple[str, int, str]]]:
     """Return (rows, skipped) - `skipped` is (zone, 1-based line number, raw
     line) for anything classify_zone_line() couldn't parse as a record, so
@@ -2295,42 +1834,6 @@ def collect_show_rows(zone_filter: str | None) -> tuple[list[list[str]], list[tu
     return rows, skipped
 
 
-def render_table(headers: list[str], rows: list[list[str]]) -> str:
-    widths = [len(h) for h in headers]
-    for row in rows:
-        for i, cell in enumerate(row):
-            widths[i] = max(widths[i], len(cell))
-    lines = []
-    header_line = "  ".join(h.ljust(widths[i]) for i, h in enumerate(headers))
-    lines.append(header_line)
-    lines.append("  ".join("-" * widths[i] for i in range(len(headers))))
-    for row in rows:
-        lines.append("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)))
-    return "\n".join(lines)
-
-
-def render_csv(headers: list[str], rows: list[list[str]]) -> str:
-    import csv
-    import io
-
-    buf = io.StringIO()
-    writer = csv.writer(buf, lineterminator="\n")
-    writer.writerow(headers)
-    writer.writerows(rows)
-    return buf.getvalue()
-
-
-def render_markdown(headers: list[str], rows: list[list[str]]) -> str:
-    def esc(cell: str) -> str:
-        return cell.replace("|", "\\|") if cell else ""
-
-    lines = ["| " + " | ".join(headers) + " |"]
-    lines.append("| " + " | ".join("---" for _ in headers) + " |")
-    for row in rows:
-        lines.append("| " + " | ".join(esc(c) for c in row) + " |")
-    return "\n".join(lines)
-
-
 def cmd_show(args) -> int:
     zone_filter = None
     if args.zone:
@@ -2355,11 +1858,11 @@ def cmd_show(args) -> int:
         return 0
 
     if args.output == "csv":
-        text = render_csv(SHOW_HEADERS, rows)
+        text = render.render_csv(render.SHOW_HEADERS, rows)
     elif args.output == "md":
-        text = render_markdown(SHOW_HEADERS, rows)
+        text = render.render_markdown(render.SHOW_HEADERS, rows)
     else:
-        text = render_table(SHOW_HEADERS, rows)
+        text = render.render_table(render.SHOW_HEADERS, rows)
 
     if args.file:
         Path(args.file).write_text(text, encoding="utf-8", newline="")
