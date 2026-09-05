@@ -50,10 +50,12 @@ This project uses two separate, zone-scoped Cloudflare API tokens instead of one
 
 | Token     | Permissions                       | Where it lives                                                           | Used by                                         |
 | --------- | --------------------------------- | ------------------------------------------------------------------------ | ----------------------------------------------- |
-| Read-only | `Zone.DNS:Read`, `Zone.Zone:Read` | Your local `.env`, and the GitHub secret `CLOUDFLARE_API_TOKEN_READONLY` | `dnscontrol preview` (locally and in CI)        |
+| Read-only | `Zone.DNS:Read`, `Zone.Zone:Read` | Your local `.env` (or Azure Key Vault — see below), and the GitHub secret `CLOUDFLARE_API_TOKEN_READONLY` | `dnscontrol preview` (locally and in CI)        |
 | Write     | `Zone.DNS:Edit`, `Zone.Zone:Read` | Only the GitHub secret `CLOUDFLARE_API_TOKEN_WRITE`                      | `dnscontrol push` (CI only, on merge to `main`) |
 
 Never put the write token anywhere on your local machine. It should exist in exactly one place: the GitHub Actions secret. See [security.md](security.md) for the reasoning.
+
+**If more than one person needs the read-only token, prefer Azure Key Vault over a local `.env`** — set `CLOUDFLARE_KEYVAULT_NAME` instead of `CLOUDFLARE_API_TOKEN` and `dnsctl.py` fetches it at runtime via `az` (never written to disk); see [security.md#key-vault-backed-tokens](security.md#key-vault-backed-tokens), [docs/keyvault-access.md](keyvault-access.md), [docs/contractor-setup-guide.md](contractor-setup-guide.md), and `.env.example`.
 
 ### Adding/rotating the GitHub secrets
 
@@ -79,6 +81,17 @@ python scripts/dnsctl.py preview
 
 You should see `Done. 0 corrections.` — that means your local config matches what's live on Cloudflare. If you see a large number of `DELETE` corrections, your `.env` token or `dnsconfig.js` is likely misconfigured — **do not proceed to `push`** — see [operations.md](operations.md#troubleshooting).
 
+## Running the test suite
+
+`scripts/dnsctl.py` has a pytest suite under `tests/` that needs no Cloudflare token or network access — it exercises the record-parsing/rewriting logic against fixture files:
+
+```sh
+pip install pytest
+pytest tests/
+```
+
+Worth running after any change to `scripts/dnsctl.py` itself; `.github/workflows/test.yml` runs the same suite in CI.
+
 ## Where things live
 
 ```
@@ -87,10 +100,15 @@ your-repo/
 ├── creds.json                 # tells dnscontrol which env var holds the Cloudflare token (no secrets)
 ├── .env                       # your local read-only token (gitignored, never committed)
 ├── .env.example                # documents what .env should contain
+├── .githooks/pre-commit         # local secret scan + dnsctl lint at commit time
 ├── .githooks/pre-push          # local safety check before pushing to main
 ├── .github/workflows/
 │   ├── preview.yml             # runs on every PR
-│   └── apply.yml                # runs on merge to main
+│   ├── apply.yml                # runs on merge to main
+│   ├── test.yml                  # lint + pytest suite on every push/PR touching the tooling
+│   ├── drift.yml                 # scheduled check that live Cloudflare still matches dnsconfig.js
+│   └── dnscontrol-version-check.yml  # scheduled check for a newer dnscontrol release
 ├── scripts/dnsctl.py            # cross-platform helper script (see docs/dnsctl-cli.md)
+├── tests/                        # pytest suite for scripts/dnsctl.py
 └── docs/                        # you are here
 ```

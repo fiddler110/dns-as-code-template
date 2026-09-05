@@ -5,7 +5,10 @@ This project manages DNS for `example.com` and `example.org` as code, using [dns
 | Doc | Read this when... |
 |---|---|
 | [getting-started.md](getting-started.md) | You're setting this project up for the first time, or cloning it on a new machine. |
+| [contractor-setup-guide.md](contractor-setup-guide.md) | You're a new contractor (or any new collaborator) doing one-time setup on a new machine — tools, repo access, and Key Vault. |
+| [keyvault-access.md](keyvault-access.md) | You're granting or revoking a collaborator's Azure Key Vault access to the Cloudflare token (the admin side of the setup guide above). |
 | [making-changes.md](making-changes.md) | You need to add, edit, or remove a DNS record (the day-to-day workflow). |
+| [DNS_Change_Process.md](DNS_Change_Process.md) | You're standardizing this for a team of contractors — roles, access controls, the end-to-end process, and how to roll back a change. |
 | [record-types.md](record-types.md) | You need syntax/examples for a specific record type (A, CNAME, MX, TXT, etc.). |
 | [ci-cd-pipeline.md](ci-cd-pipeline.md) | You want to understand exactly what the GitHub Actions workflows do and why. |
 | [operations.md](operations.md) | You're rotating tokens, re-importing the zone, recovering from a mistake, or debugging a failure. |
