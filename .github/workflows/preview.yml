@@ -8,6 +8,8 @@ name: DNS Preview
 #
 # on:
 #   pull_request:
+#     # Keep dnsconfig.js/creds.json here in sync with the dns_relevant_paths
+#     # list in .githooks/pre-push.
 #     paths:
 #       - "dnsconfig.js"
 #       - "creds.json"
@@ -21,7 +23,7 @@ permissions:
 jobs:
   preview:
     runs-on: ubuntu-latest
-    # Read-only token only — this job must never see the write token, and
+    # Read-only token only - this job must never see the write token, and
     # pull_request (not pull_request_target) keeps forked PRs from reaching
     # repo secrets at all.
     env:
@@ -34,8 +36,13 @@ jobs:
         env:
           DNSCONTROL_VERSION: "4.46.0"
         run: |
-          curl -sSL "https://github.com/DNSControl/dnscontrol/releases/download/v${DNSCONTROL_VERSION}/dnscontrol_${DNSCONTROL_VERSION}_linux_amd64.tar.gz" \
-            | tar -xz dnscontrol
+          set -euo pipefail
+          base="https://github.com/DNSControl/dnscontrol/releases/download/v${DNSCONTROL_VERSION}"
+          asset="dnscontrol_${DNSCONTROL_VERSION}_linux_amd64.tar.gz"
+          curl -sSLo "$asset" "${base}/${asset}"
+          curl -sSLo checksums.txt "${base}/checksums.txt"
+          grep " ${asset}\$" checksums.txt | sha256sum -c -
+          tar -xzf "$asset" dnscontrol
           sudo mv dnscontrol /usr/local/bin/dnscontrol
           dnscontrol version
 
@@ -51,11 +58,31 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const output = fs.readFileSync('preview_output.txt', 'utf8').slice(0, 60000);
-            const body = `### dnscontrol preview\n\n\`\`\`\n${output}\n\`\`\``;
-            await github.rest.issues.createComment({
+            const marker = '### dnscontrol preview';
+            const output = fs.existsSync('preview_output.txt')
+              ? fs.readFileSync('preview_output.txt', 'utf8').slice(0, 60000)
+              : '_No preview output was produced - an earlier step failed. See the workflow log._';
+            const body = `${marker}\n\n\`\`\`\n${output}\n\`\`\``;
+
+            const comments = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body,
             });
+            const existing = comments.data.find((c) => c.body && c.body.startsWith(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }

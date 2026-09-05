@@ -10,35 +10,67 @@ name: DNS Apply
 #   push:
 #     branches:
 #       - main
+#     # Keep dnsconfig.js/creds.json here in sync with the dns_relevant_paths
+#     # list in .githooks/pre-push.
 #     paths:
 #       - "dnsconfig.js"
 #       - "creds.json"
 #       - ".github/workflows/apply.yml"
+#   workflow_dispatch:
 on: {}
+
+concurrency:
+  group: dns-apply
+  cancel-in-progress: false
 
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
   apply:
     runs-on: ubuntu-latest
-    # No Environment approval gate: solo project, so a required-reviewer step
-    # would just block on self-approval. The PR review + preview check before
-    # merge is the checkpoint instead.
+    # No Environment approval gate: solo/small-team project, so a
+    # required-reviewer step would just block on self-approval. The PR
+    # review + preview check before merge is the checkpoint instead. The
+    # "merged PR" guard below is what actually enforces that gate
+    # server-side - see docs/security.md.
     env:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN_WRITE }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Require this commit to come from a merged pull request
+        if: github.event_name != 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          merged=$(gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/pulls" \
+            --jq '[.[] | select(.merged_at != null)] | length')
+          if [ "$merged" -eq 0 ]; then
+            echo "::error::Commit ${{ github.sha }} has no merged pull request. Refusing to apply DNS changes."
+            echo "Push DNS changes via a PR, or use the manual workflow_dispatch trigger if this is intentional."
+            exit 1
+          fi
+
       - name: Install dnscontrol
         env:
           DNSCONTROL_VERSION: "4.46.0"
         run: |
-          curl -sSL "https://github.com/DNSControl/dnscontrol/releases/download/v${DNSCONTROL_VERSION}/dnscontrol_${DNSCONTROL_VERSION}_linux_amd64.tar.gz" \
-            | tar -xz dnscontrol
+          set -euo pipefail
+          base="https://github.com/DNSControl/dnscontrol/releases/download/v${DNSCONTROL_VERSION}"
+          asset="dnscontrol_${DNSCONTROL_VERSION}_linux_amd64.tar.gz"
+          curl -sSLo "$asset" "${base}/${asset}"
+          curl -sSLo checksums.txt "${base}/checksums.txt"
+          grep " ${asset}\$" checksums.txt | sha256sum -c -
+          tar -xzf "$asset" dnscontrol
           sudo mv dnscontrol /usr/local/bin/dnscontrol
           dnscontrol version
+
+      - name: Preview before applying
+        run: dnscontrol preview
 
       - name: Run dnscontrol push
         run: dnscontrol push

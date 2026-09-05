@@ -43,11 +43,34 @@ Commit the result. Treat this the same as any other change — through a PR, wit
 `_acme-challenge` TXT records accumulate over time as certificates renew — old validation tokens are usually safe to remove once the renewal they were for has completed, but nothing here tracks that automatically.
 
 ```sh
-python scripts/dnsctl.py record prune-acme                # report only, flags names with multiple tokens
+python scripts/dnsctl.py record prune-acme                # live cross-check by default (needs .env), report only
+python scripts/dnsctl.py record prune-acme --offline       # skip the live check, heuristic only, no .env/network needed
 python scripts/dnsctl.py record prune-acme --remove 2 3    # remove specific ones by index, with confirmation
+python scripts/dnsctl.py record prune-acme --remove 1-6    # ranges/combos work too: 1,2,4-6
 ```
 
-This is report-first and never guesses which token is still "current" — cross-check against whatever issued the certificate (e.g. your reverse proxy's ACME client logs) before removing one. See [dnsctl-cli.md](dnsctl-cli.md#record-prune-acme).
+This is report-first and never guesses which token is still "current" on faith alone — with `.env` configured it cross-checks against real Cloudflare state automatically (falling back to the token-count heuristic if no token is set or the fetch fails), but still cross-check against whatever issued the certificate (e.g. your reverse proxy's ACME client logs) before removing one, since "gone from Cloudflare" only means gone *now*, not that it wasn't mid-renewal until just recently. The live check only annotates the report; it never edits `dnsconfig.js`. Note the direction of drift it can also surface: if an ACME client has its own separate Cloudflare credential and writes/deletes `_acme-challenge` records directly (bypassing this repo), `dnsconfig.js` and Cloudflare can diverge in *either* direction — a record deleted upstream but still listed locally will get silently recreated by the next unrelated `apply` (dnscontrol always pushes `dnsconfig.js` onto Cloudflare), while a record added upstream but missing locally would get deleted by that same apply. The live check flags both cases; only actually removing the stale line via `--remove` (through the normal PR flow) fixes the former, and folding a new live-only record into `dnsconfig.js` via [re-baselining](#re-baselining-a-zone) fixes the latter. See [dnsctl-cli.md](dnsctl-cli.md#record-prune-acme).
+
+If an ACME client genuinely owns these records end-to-end (e.g. a reverse proxy renewing certs with its own Cloudflare token, as opposed to occasional manual dashboard edits), treating Cloudflare as the source of truth for just `_acme-challenge` and folding it into `dnsconfig.js` wholesale is usually less friction than reviewing individual add/remove drift every renewal:
+
+```sh
+python scripts/dnsctl.py record sync-acme
+```
+
+This adds whatever's live but not yet in `dnsconfig.js` and removes whatever's local but no longer live, after showing the diff and asking to confirm — then goes through the normal preview/PR/apply flow like any other change. It only ever touches `_acme-challenge` TXT lines; everything else in `dnsconfig.js` keeps `dnsconfig.js` → Cloudflare as the direction of truth. See [dnsctl-cli.md](dnsctl-cli.md#record-sync-acme).
+
+## Responding to detected drift
+
+`.github/workflows/drift.yml` (once its trigger is enabled — see [getting-started.md](getting-started.md)) runs `dnscontrol preview --expect-no-changes` against every managed zone on a weekly schedule using the **read-only** token. If it finds a difference between `dnsconfig.js` and live state, it fails and files (or updates) a single persistent GitHub issue titled "DNS drift detected" with the diff, rather than opening a new issue every run. You can also trigger it manually from the Actions tab (`workflow_dispatch`).
+
+When that issue appears, decide which case you're in before doing anything else:
+
+- **Legitimate dashboard change** (e.g. an emergency fix made directly in Cloudflare because the pipeline was down) — reconcile it into `dnsconfig.js` via the [re-baselining](#re-baselining-a-zone) process above, so the repo goes back to being the actual source of truth. Do this through a PR like any other change.
+- **Unauthorized or unexplained change** — treat the write token as potentially compromised and [rotate it](#rotating-cloudflare-api-tokens) immediately, then investigate (Cloudflare's audit log will show who/what made the change).
+
+Close the tracking issue once the drift is resolved either way — the workflow will reopen or refile it automatically if it recurs.
+
+**Known limitation:** GitHub disables scheduled workflows on a repository with no push activity for 60 days. For a low-traffic config repo, drift detection can silently stop running if nothing else has been pushed in a while — a manual `workflow_dispatch` run periodically (or any other commit to the repo) resets that clock.
 
 ## Recovering from a bad `apply`
 
@@ -59,6 +82,23 @@ If `dnscontrol push` applies something wrong (bad merge, typo that passed review
 4. Merge — `apply.yml` will push the fix to Cloudflare.
 
 For anything affecting mail (MX/SPF/DKIM/DMARC) or the apex A record, this round-trip can take a few minutes to propagate depending on TTLs and Cloudflare's own caching — don't assume it's still broken just because a check a few seconds after merge still shows the old behavior.
+
+## Manually triggering an apply
+
+`apply.yml` normally only runs on a push to `main`, and (if you've wired up the merged-PR gate
+described in [security.md](security.md#why-the-pr-gate-is-enforced-inside-applyyml-not-by-github-branch-protection))
+refuses to apply unless that commit is associated with a merged pull request. For the rare case
+where you need to re-run an apply without a new commit — e.g. retrying after a transient Cloudflare
+API error or an expired token, rather than pushing an empty commit — trigger it manually instead:
+
+```sh
+gh workflow run "DNS Apply" --repo YOUR_USERNAME/YOUR_REPO
+```
+
+or from the GitHub UI: Actions → DNS Apply → Run workflow. A manual (`workflow_dispatch`) run skips
+the merged-PR guard, since triggering it is itself a deliberate, authenticated, and logged action —
+use this instead of weakening or bypassing the guard for an emergency direct apply. It will be a
+no-op (dnscontrol reports no changes) if `main` is already in sync with Cloudflare.
 
 ## Troubleshooting
 

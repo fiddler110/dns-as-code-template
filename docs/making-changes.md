@@ -7,12 +7,15 @@ This is the day-to-day workflow for adding, editing, or removing a record on any
 The short version, using the [`dnsctl.py` helper](dnsctl-cli.md):
 
 ```sh
+python scripts/dnsctl.py begin "Add CNAME for myapp"      # sync main, check for drift, create a branch
 # edit dnsconfig.js
-python scripts/dnsctl.py submit "Add CNAME for myapp"   # preview, branch, commit, push, open PR
+python scripts/dnsctl.py submit "Add CNAME for myapp"     # preview, commit, push, open PR
 python scripts/dnsctl.py status                          # wait for the DNS Preview check
 python scripts/dnsctl.py review <PR#>                     # read the diff before merging
-python scripts/dnsctl.py merge <PR#>                      # merge once it looks right
+python scripts/dnsctl.py merge <PR#> --wait               # merge, then wait and confirm it's live
 ```
+
+`begin` is the recommended starting point — see [dnsctl-cli.md#begin](dnsctl-cli.md#begin) for exactly what it checks. Don't stop at "merged" — `merge --wait` (or `validate` run separately afterward, see [dnsctl-cli.md#validate](dnsctl-cli.md#validate)) confirms the `DNS Apply` workflow actually succeeded and live Cloudflare matches `dnsconfig.js`, closing the loop instead of leaving you to check the Actions tab by hand. If something merged to `main` needs to be undone, see [dnsctl-cli.md#rollback](dnsctl-cli.md#rollback) instead of hand-editing `dnsconfig.js` back.
 
 Or the equivalent manual steps:
 
@@ -82,6 +85,17 @@ Or delete the line from `dnsconfig.js` directly. Either way, `preview` will show
 ## A note on TXT records with multiple values
 
 Some names in this zone (e.g. `_acme-challenge`) intentionally have several `TXT` records with different values (ACME/Let's Encrypt validation tokens, etc.). Each is its own separate `TXT(...)` line in `dnsconfig.js` — don't try to combine them into one call. When ACME tokens rotate, old ones can usually be deleted; check with whatever issued them (e.g. your reverse proxy / cert manager) if unsure before removing one.
+
+## Working on `dnsctl.py` itself
+
+If you're changing `scripts/dnsctl.py` (not just `dnsconfig.js`), run the test suite before opening a PR:
+
+```sh
+pip install pytest
+pytest tests/ -v
+```
+
+Tests live in `tests/`, use fixture `.js` files under `tests/fixtures/`, and never touch the real `dnsconfig.js` or the network — each one points the module at a temporary copy of a fixture. The `test.yml` workflow runs this suite automatically whenever `scripts/**` or `tests/**` changes, independent of whether `dnsconfig.js` changed.
 
 ## Common mistakes to avoid
 

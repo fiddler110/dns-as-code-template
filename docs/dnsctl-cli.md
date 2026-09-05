@@ -12,7 +12,7 @@ python scripts/dnsctl.py <command> [options]
 
 ### `doctor`
 
-Checks that your local environment is ready to work with this project: dnscontrol is installed and on PATH (or found in the usual `go install` location), `.env` exists with `CLOUDFLARE_API_TOKEN` set, `creds.json` has the correct `apitoken` key, and the local git hook is enabled. Exits non-zero if anything fails.
+Checks that your local environment is ready to work with this project: dnscontrol is installed and on PATH (or found in the usual `go install` location), a `CLOUDFLARE_API_TOKEN` is available from `.env`, the environment, or Azure Key Vault (see [security.md#key-vault-backed-tokens](security.md#key-vault-backed-tokens)), `creds.json` has the correct `apitoken` key, and the local git hook is enabled. Reports which of those three sources actually provided the token. Exits non-zero if anything fails.
 
 ```sh
 python scripts/dnsctl.py doctor
@@ -78,6 +78,30 @@ python scripts/dnsctl.py import --zone example.org --out somewhere-else.js
 
 This is also how a brand new zone gets onboarded: `import --zone newzone.com` snapshots what's already live on Cloudflare, you paste the result in as a new `D("newzone.com", REG, DnsProvider(CF), ...)` block in `dnsconfig.js`, add `"newzone.com"` to the `ZONES` list near the top of `scripts/dnsctl.py`, and confirm `preview` reports 0 corrections before committing — the GitHub Actions workflows and the pre-push hook need no changes at all, since they just run `dnscontrol preview`/`push` against whatever zones are defined in `dnsconfig.js`.
 
+### `begin`
+
+Starts a DNS change the same way every time — the recommended first command for anyone (especially a contractor) about to touch `dnsconfig.js`. Refuses to run over uncommitted changes, so it never clobbers work in progress.
+
+```sh
+python scripts/dnsctl.py begin "add cname for myapp"
+```
+
+What it does, in order:
+1. Aborts if your working tree isn't clean (commit/stash first).
+2. Switches to `main` (or `--base`) and fast-forwards it to `origin/main` — aborts rather than force-updating if your local branch has diverged.
+3. Runs `dnscontrol preview --expect-no-changes` against the freshly-synced branch to catch drift *before* you start (an out-of-band dashboard edit, or an apply that hasn't landed) — warns and asks to continue rather than silently building your change on top of an inconsistent baseline.
+4. Creates a new branch (`dns/<slug-of-description>` by default, or `--branch <name>`).
+5. Checks `_acme-challenge` records against live Cloudflare and folds in any drift (same logic as `record sync-acme`, without its own premature "open a PR?" prompt) — these tokens rotate outside this repo's control, so this keeps that housekeeping out of your way instead of showing up as a surprise in your diff later.
+6. Prints the next steps (edit → `lint` → `preview` → `submit`).
+
+Options:
+- `description` — short text used for the branch name; prompted if omitted.
+- `--branch <name>` — explicit branch name.
+- `--base <branch>` — branch to sync from (default `main`).
+- `--yes` — don't prompt on the drift/ACME-sync checks (auto-continue past drift warnings, auto-apply the ACME sync). Use with care — this is meant for scripting/CI, not for skipping past a warning you haven't read.
+
+If `.env` has no `CLOUDFLARE_API_TOKEN`, steps 3 and 5 are skipped with a note (they need a token to talk to Cloudflare) — the sync/branch steps still happen.
+
 ### `submit`
 
 Automates the whole "propose a change" workflow from [making-changes.md](making-changes.md): runs `dnscontrol preview` as a sanity check, creates a branch, commits your staged file(s), pushes, and opens a PR — in one command.
@@ -121,7 +145,7 @@ python scripts/dnsctl.py record add plex.example.com
 - **Apex/naked domain**: give the zone name itself (`example.com`) or `--zone example.com` with target left off - both map to the apex record (`@`).
 - **Wildcard**: `*.example.com` maps to the name `*`, the usual DNS convention for a catch-all subdomain.
 - A trailing dot on the input (`plex.example.com.`) is tolerated and stripped; matching is case-insensitive.
-- A name that doesn't end in any zone this project manages (e.g. `plex.example.com`) is rejected outright — this project can't create records outside its own zones, so this is almost always a typo.
+- A name that doesn't end in any zone this project manages (e.g. `plex.some-other-domain.net`) is rejected outright — this project can't create records outside its own zones, so this is almost always a typo.
 
 Interactive walkthrough example:
 
@@ -194,23 +218,37 @@ Omitted fields (priority, proxy, TTL) keep their current value — interactively
 Bulk-replaces an IP across **every** `A` record currently pointing at it — built for the common homelab situation of a residential IP changing, where several records (e.g. the apex plus a Cloudflare tunnel or two) all point at the same address and hand-editing each one is error-prone.
 
 ```sh
-python scripts/dnsctl.py record update-ip 203.0.113.10 203.0.113.50
-python scripts/dnsctl.py record update-ip 203.0.113.10 203.0.113.50 --zone example.com --yes
+python scripts/dnsctl.py record update-ip 198.51.100.10 198.51.100.20
+python scripts/dnsctl.py record update-ip 198.51.100.10 198.51.100.20 --zone example.com --yes
 ```
 
 Lists every matching record's FQDN before asking for confirmation, preserves each record's existing proxy/TTL settings, and only touches `A` records with an exact value match. Defaults to checking all managed zones; `--zone` restricts to one.
 
 ### `record prune-acme`
 
-Reports on `_acme-challenge` TXT records, grouped by name, flagging any name with more than one token as likely containing stale validation codes left over from earlier certificate renewals (ACME/Let's Encrypt tokens are typically only valid for the renewal that created them). Report-only by default — it never deletes anything unless you explicitly say which ones.
+Reports on `_acme-challenge` TXT records, grouped by name. By default (when `.env` is configured) it cross-checks each one against real Cloudflare state via `dnscontrol get-zones`, annotating every entry as `[confirmed gone from Cloudflare - safe to remove]` or `[still live on Cloudflare]` — falling back to the "more than one token under this name" heuristic only if no token is available or the live fetch fails. Report-only either way — it never deletes anything unless you explicitly say which ones.
 
 ```sh
-python scripts/dnsctl.py record prune-acme                              # just list/flag, don't touch anything
+python scripts/dnsctl.py record prune-acme                              # live cross-check by default, just list/flag
+python scripts/dnsctl.py record prune-acme --offline                    # skip the live check, heuristic only, no network/.env needed
 python scripts/dnsctl.py record prune-acme --zone example.com --remove 2 3 5
+python scripts/dnsctl.py record prune-acme --remove 1-6                 # ranges and combos also work: 1,2,4-6
 ```
 
-`--remove <index> [<index> ...]` deletes the specific records at those indices (from the listing) after a confirmation showing exactly which lines will go — pass `--yes` to skip that prompt too. There's no automatic "keep the newest N" heuristic: only your cert issuer/reverse-proxy config actually knows which token is still in use, so cross-check there before removing one.
+`--remove <index> [<index> ...]` deletes the specific records at those indices (from the listing) after a confirmation showing exactly which lines will go — pass `--yes` to skip that prompt too. Each `INDEX` accepts a plain number, a range (`1-6`), or a comma-separated combo (`1,2,4-6`), and multiple can be space-separated. There's no automatic "keep the newest N" heuristic: only your cert issuer/reverse-proxy config actually knows which token is still in use, so cross-check there before removing one.
 
+The live cross-check also separately warns about any record that exists on Cloudflare but is missing from `dnsconfig.js` — that's the more dangerous direction of drift, since the next `apply` (from *any* merged PR, not just an ACME-related one) makes Cloudflare match `dnsconfig.js` and would delete that record, possibly a token from an in-flight renewal. Remember it only *reports* — deleting a stale line always still requires a separate `--remove`, going through the normal PR flow, since simply flagging something doesn't stop a future apply from resurrecting it.
+
+### `record sync-acme`
+
+For projects where an out-of-band ACME client (e.g. Caddy with its own separate Cloudflare credential) owns `_acme-challenge` records directly, treats live Cloudflare state as the source of truth for *just* those records and folds it into `dnsconfig.js` — adding whatever's live but missing locally, removing whatever's local but no longer live. Unlike `prune-acme`, this actually writes the file (after a confirmation).
+
+```sh
+python scripts/dnsctl.py record sync-acme
+python scripts/dnsctl.py record sync-acme --zone example.com --yes
+```
+
+Requires `.env`. Shows the full add/remove diff before asking to apply — pass `--yes` to skip the prompt and the preview/submit offer. Only touches `_acme-challenge` TXT lines; every other record in `dnsconfig.js` is untouched and still treated as authoritative in the normal (`dnsconfig.js` → Cloudflare) direction. After it runs, `prune-acme`/`preview` should report 0 drift for ACME records until the next renewal.
 ### `lint`
 
 Fast, offline sanity checks over `dnsconfig.js` — no dnscontrol binary, no network call, so it's cheap to run constantly (e.g. as a first check before `preview`, or wired into an editor's save hook). Catches:
@@ -282,11 +320,58 @@ Merges a PR, but only after checking its `DNS Preview` check succeeded — refus
 python scripts/dnsctl.py merge 4
 python scripts/dnsctl.py merge 4 --yes     # skip the confirmation prompt
 python scripts/dnsctl.py merge 4 --force   # merge despite a failed/missing check (use with care)
+python scripts/dnsctl.py merge 4 --wait    # also wait for DNS Apply and confirm live state (see `validate`)
 ```
 
-This runs `gh pr merge --merge --delete-branch`, which triggers the same `DNS Apply` GitHub Actions workflow as merging through the GitHub web UI — the effect on Cloudflare is identical either way. Like the review-diff step, this is meant to save a trip to the browser, not to change what merging actually does.
+This runs `gh pr merge --merge --delete-branch`, which triggers the same `DNS Apply` GitHub Actions workflow as merging through the GitHub web UI — the effect on Cloudflare is identical either way. Like the review-diff step, this is meant to save a trip to the browser, not to change what merging actually does. Without `--wait`, it prints a reminder to run `validate` yourself; with `--wait`, it runs the exact same check inline before returning — see [`validate`](#validate) below for exactly what that check does. `--timeout <seconds>` (default 300) controls how long `--wait` waits for `DNS Apply` to appear/complete.
 
-**Verified**: `submit`, `status`, `review`, `approve` (self-approval rejection path), and `merge` were all run against real test PRs during development, including a full `merge` → `DNS Apply` → live Cloudflare round trip that was then cleanly reverted with a second `submit`/`merge` cycle.
+### `history`
+
+Lists commits on `main` that touched `dnsconfig.js`, newest first — the input to `rollback`. Deliberately not limited to two-parent merge commits: this repo's history has a mix of squash-merged and true-merge PRs, and both are valid `rollback` targets (each entry is tagged `(merge)` when it has more than one parent, which only changes which `git revert` form is used under the hood).
+
+```sh
+python scripts/dnsctl.py history
+python scripts/dnsctl.py history --limit 50
+```
+
+### `rollback`
+
+Reverts a previously-merged `dnsconfig.js` change by opening a normal PR — it never pushes to `main` directly, so an emergency rollback still goes through the same `DNS Preview` → review → `merge` → `DNS Apply` pipeline as any other change (see [security.md](security.md) for why direct pushes are blocked at all).
+
+```sh
+python scripts/dnsctl.py rollback 19       # by PR number
+python scripts/dnsctl.py rollback 6bf3a48  # by commit SHA (see `history`)
+```
+
+What it does, in order:
+1. Aborts if your working tree isn't clean, or if `main` can't fast-forward to `origin/main`.
+2. Resolves the target: a PR number is looked up via `gh pr view --json mergeCommit` (works whether that PR was squash- or merge-committed); a raw SHA is used as-is.
+3. Creates a branch (`dns/revert-<sha>`) and runs `git revert` on the target commit — `-m 1` is added automatically only if the target has more than one parent (a true merge commit).
+4. If the revert hits a conflict, stops and tells you to resolve it manually, then finish with `preview` + `submit` yourself.
+5. Runs `dnscontrol preview` and asks you to confirm the diff looks like the exact inverse of the original change before continuing (skip with `--yes`).
+6. Pushes the branch and opens a PR titled `Revert: <original subject>`.
+
+From there it's the normal flow: `status` / `review <PR#>` / `merge <PR#>` to let it apply. Use `history` first to find the right target — the entry's PR number (if the commit message names one) or its short SHA both work.
+
+### `validate`
+
+Confirms a merge actually landed: finds the `DNS Apply` run for a commit, waits for it to finish, then re-runs `dnscontrol preview --expect-no-changes` to confirm live Cloudflare now matches `dnsconfig.js`. This is what `merge` otherwise leaves you to do by hand ("watch the Actions tab yourself") — use it as the last step of every change, not just when something seems wrong.
+
+```sh
+python scripts/dnsctl.py validate            # validate the current tip of main
+python scripts/dnsctl.py validate 19         # validate a specific PR's merge
+python scripts/dnsctl.py validate 6bf3a48    # validate a specific commit SHA
+python scripts/dnsctl.py validate --timeout 600   # wait up to 10 minutes instead of the 5-minute default
+```
+
+What it does, in order:
+1. Aborts if your working tree isn't clean; otherwise switches to `main` and fast-forwards it to `origin/main` (same guard `begin`/`rollback` use) — it always checks live state against the *current* `main`, regardless of which past commit's apply run it's confirming, since that's the invariant that actually matters.
+2. Resolves the target the same way `rollback` does — a PR number via `gh pr view`, a raw SHA used as-is, or (with no argument) the freshly-synced tip of `main`.
+3. Polls `gh run list` for a `DNS Apply` run matching that commit's SHA, up to `--timeout` seconds.
+4. Once found, streams its progress via `gh run watch --exit-status` until it completes; fails loudly (with a link to the run) if it didn't succeed.
+5. Runs `dnscontrol preview --expect-no-changes`. Zero corrections means validated: the apply landed and live Cloudflare matches `dnsconfig.js` exactly. Any corrections here almost always mean a *second*, unrelated drift source (e.g. an out-of-band ACME renewal) rather than a problem with the apply itself — see [operations.md#responding-to-detected-drift](operations.md#responding-to-detected-drift).
+
+`merge --wait` runs this automatically right after merging — see [`merge`](#merge) above.
 
 ## Why Python instead of separate shell/PowerShell scripts
 

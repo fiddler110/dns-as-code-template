@@ -62,9 +62,22 @@ Not currently used in this zone, but relevant if a subdomain needs to be delegat
 ```js
 CAA("@", "issue", "letsencrypt.org"),
 CAA("@", "issuewild", "letsencrypt.org"),
+CAA("@", "iodef", "mailto:you@example.com"),
 ```
 
-Not currently used, but worth adding if you want to lock down which CAs are allowed to issue certificates for `example.com`.
+Not currently used, but worth adding if you want to lock down which CAs are allowed to issue
+certificates for `example.com` — without it, any public CA can be persuaded to issue a cert for the
+domain.
+
+- **`issue`** — CAs allowed to issue any (non-wildcard) certificate. One `CAA` line per allowed
+  issuer.
+- **`issuewild`** — CAs allowed to issue *wildcard* certificates (e.g. `*.example.com`). Can be a
+  different, narrower list than `issue`; use `CAA("@", "issuewild", ";")` to forbid wildcard
+  issuance entirely.
+- **`iodef`** — a `mailto:` (or `https:`) URL some CAs will notify if they receive a request for a
+  certificate that violates this policy. Not universally honored, but harmless to set.
+- `dnsctl record add` does not support CAA (it only covers A/CNAME/MX/TXT) — add or edit these by
+  hand directly in `dnsconfig.js`.
 
 ## SRV — service discovery records
 

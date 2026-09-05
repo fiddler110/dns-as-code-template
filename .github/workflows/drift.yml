@@ -1,0 +1,88 @@
+name: DNS Drift Detection
+
+# Trigger is commented out in this template - it has no real Cloudflare
+# credentials, so a scheduled run would just fail (and, worse, file a false
+# "drift detected" issue). Uncomment the `on:` block below (and remove the
+# `on: {}` placeholder) once you've replaced the example zones in
+# dnsconfig.js and set up the CLOUDFLARE_API_TOKEN_READONLY secret - see
+# docs/getting-started.md and docs/branch-protection-and-secrets.md.
+#
+# on:
+#   schedule:
+#     - cron: "0 13 * * 1"   # weekly, Monday 13:00 UTC
+#   workflow_dispatch:
+on: {}
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    # Read-only token only - this job never applies anything, only detects.
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN_READONLY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dnscontrol
+        env:
+          DNSCONTROL_VERSION: "4.46.0"
+        run: |
+          set -euo pipefail
+          base="https://github.com/DNSControl/dnscontrol/releases/download/v${DNSCONTROL_VERSION}"
+          asset="dnscontrol_${DNSCONTROL_VERSION}_linux_amd64.tar.gz"
+          curl -sSLo "$asset" "${base}/${asset}"
+          curl -sSLo checksums.txt "${base}/checksums.txt"
+          grep " ${asset}\$" checksums.txt | sha256sum -c -
+          tar -xzf "$asset" dnscontrol
+          sudo mv dnscontrol /usr/local/bin/dnscontrol
+          dnscontrol version
+
+      - name: Check for drift
+        id: drift
+        run: |
+          set -o pipefail
+          dnscontrol preview --expect-no-changes 2>&1 | tee drift.txt
+
+      - name: File or update drift issue
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const output = fs.existsSync('drift.txt')
+              ? fs.readFileSync('drift.txt', 'utf8').slice(0, 60000)
+              : '_No drift output was captured - the workflow failed before the check ran. See the workflow log._';
+            const marker = '<!-- dns-drift-tracking-issue -->';
+            const title = 'DNS drift detected';
+            const body = `${marker}\n### DNS drift detected\n\nA scheduled \`dnscontrol preview --expect-no-changes\` run found a difference between \`dnsconfig.js\` and the live Cloudflare zones.\n\nLatest run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\n\`\`\`\n${output}\n\`\`\`\n\nSee [docs/operations.md#responding-to-detected-drift](https://github.com/${context.repo.owner}/${context.repo.repo}/blob/main/docs/operations.md#responding-to-detected-drift) for how to respond.`;
+
+            const existing = await github.rest.search.issuesAndPullRequests({
+              q: `repo:${context.repo.owner}/${context.repo.repo} is:issue is:open in:body "${marker}"`,
+            });
+
+            if (existing.data.items.length > 0) {
+              const issue = existing.data.items[0];
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body,
+              });
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: `Drift detected again on this run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+              });
+            }
