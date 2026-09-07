@@ -1,0 +1,106 @@
+name: DNS Reachability Check
+
+on:
+  workflow_run:
+    workflows: ["DNS Apply"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  reachability:
+    # Only run after a real apply succeeded - a failed/cancelled DNS Apply run
+    # already gets its own tracking issue, and this check is only meaningful
+    # once dnsconfig.js has actually been pushed to Cloudflare. Note that this
+    # workflow stays effectively dormant while DNS Apply's own triggers are
+    # disabled (the template default) - workflow_dispatch still works for a
+    # manual run, since it has no workflow_run context and is always let
+    # through.
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # No Cloudflare token at all - this only makes outbound HTTPS requests to
+    # public hostnames, it never talks to the Cloudflare API.
+    steps:
+      - name: Check hostname reachability
+        id: check
+        run: |
+          set -uo pipefail
+
+          # Keep this list in sync with the CF_PROXY_ON records in
+          # dnsconfig.js. Only hostnames actually proxied through Cloudflare
+          # belong here - an unproxied (CF_PROXY_OFF or no proxy modifier)
+          # hostname isn't served through Cloudflare's edge, so an HTTP check
+          # here wouldn't be checking the thing this workflow exists to check.
+          hosts=(
+            "example.com"
+            "www.example.com"
+          )
+
+          failures=()
+          for host in "${hosts[@]}"; do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 --retry 2 "https://${host}/" 2>curl_err.txt)
+            status=$?
+            if [ "$status" -ne 0 ] || [ -z "$code" ]; then
+              err="$(cat curl_err.txt)"
+              echo "FAIL: $host - curl exit $status: $err"
+              failures+=("$host - curl exit ${status}: ${err:-no response}")
+            else
+              # Any HTTP status code (including 4xx/5xx) means the request
+              # reached something behind Cloudflare's edge - that's an
+              # application-level concern, not a DNS/reachability failure, so
+              # it's not treated as a failure here.
+              echo "OK: $host - HTTP $code"
+            fi
+            rm -f curl_err.txt
+          done
+
+          if [ "${#failures[@]}" -gt 0 ]; then
+            printf '%s\n' "${failures[@]}" > reachability_failures.txt
+            echo "failed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "failed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: File or update reachability issue
+        if: steps.check.outputs.failed == 'true'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
+        with:
+          script: |
+            const fs = require('fs');
+            const output = fs.existsSync('reachability_failures.txt')
+              ? fs.readFileSync('reachability_failures.txt', 'utf8').slice(0, 60000)
+              : '_No failure output was captured - see the workflow log._';
+            const marker = '<!-- dns-reachability-tracking-issue -->';
+            const title = 'DNS reachability check failed';
+            const body = `${marker}\n### DNS reachability check failed\n\nA post-apply reachability check found one or more proxied hostnames that could not be connected to at all (DNS resolution failure, TLS handshake failure, connection refused/timeout). An HTTP response of any status code - even 4xx/5xx - counts as reachable and is not reported here, since that's an application-level concern rather than a DNS one.\n\nLatest run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\n\`\`\`\n${output}\n\`\`\`\n\nSee [docs/operations.md#responding-to-a-reachability-failure](https://github.com/${context.repo.owner}/${context.repo.repo}/blob/main/docs/operations.md#responding-to-a-reachability-failure) for how to respond.`;
+
+            const existing = await github.rest.search.issuesAndPullRequests({
+              q: `repo:${context.repo.owner}/${context.repo.repo} is:issue is:open in:body "${marker}"`,
+            });
+
+            if (existing.data.items.length > 0) {
+              const issue = existing.data.items[0];
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body,
+              });
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: `Reachability check failed again: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+              });
+            }

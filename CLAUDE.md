@@ -31,16 +31,17 @@ in flight on another branch. This template doesn't ship with one — add it if u
 - **The write-scoped Cloudflare token lives only as a GitHub Actions secret** used by
   `apply.yml`. Never add `CLOUDFLARE_API_TOKEN_WRITE` back into local `.env` — see
   [docs/security.md](docs/security.md).
-- **This template's CI triggers ship disabled** (`on: {}` in `preview.yml`, `apply.yml`, and
-  `drift.yml`) because there are no real Cloudflare credentials configured yet. Don't "fix" that by
-  enabling them until the example zones have been replaced and the secrets are set up — see
-  [docs/getting-started.md](docs/getting-started.md).
+- **This template's CI triggers ship disabled** (`on: {}` in `preview.yml`, `apply.yml`,
+  `drift.yml`, `reachability.yml`, and `secret-scan.yml`) because there are no real Cloudflare
+  credentials configured yet. Don't "fix" that by enabling them until the example zones have been
+  replaced and the secrets are set up — see [docs/getting-started.md](docs/getting-started.md).
 
 ## The `dnsctl.py` helper
 
 `scripts/dnsctl.py` (Python 3 stdlib only, no `pip install`) wraps the common operations —
-`doctor`, `begin`, `lint`, `preview`, `show`, `record add`/`remove`/`edit`/`update-ip`/`prune-acme`/
-`sync-acme`, `submit`, `status`, `review`, `merge`, `validate`, `history`, `rollback`. Run
+`doctor`, `begin`, `lint`, `fmt`, `preview`, `show`,
+`record add`/`remove`/`edit`/`update-ip`/`prune-acme`/`sync-acme`,
+`submit`, `status`, `review`, `merge`, `validate`, `history`, `rollback`. Run
 `python scripts/dnsctl.py doctor` first in any new session to confirm the local environment is set
 up correctly, `python scripts/dnsctl.py begin "<description>"` to start any new change (syncs
 `main`, checks for drift, creates a branch), and `python scripts/dnsctl.py merge <PR#> --wait` (or
@@ -55,8 +56,8 @@ diff is exactly what's intended — nothing else. See
 ## Tests
 
 A `tests/` directory (pytest, stdlib fixtures under `tests/fixtures/`) covers
-`scripts/dnsctl.py`'s record-parsing/rewriting logic — no network access or Cloudflare token
-needed. Run the suite with:
+`scripts/dnsctl.py`'s record-parsing/rewriting and CLI-handler logic — no network access or
+Cloudflare token needed. Run the suite with:
 
 ```sh
 pip install pytest
@@ -77,3 +78,6 @@ pytest tests/
 - [docs/ci-cd-pipeline.md](docs/ci-cd-pipeline.md) — what the GitHub Actions workflows and the
   local git hooks actually do.
 - [docs/security.md](docs/security.md) — threat model and why the project is set up this way.
+- [docs/validation_testing.md](docs/validation_testing.md) — how to validate a change end-to-end
+  once real credentials and zones are configured.
+- [SECURITY.md](SECURITY.md) — how to report a security issue in this template itself.

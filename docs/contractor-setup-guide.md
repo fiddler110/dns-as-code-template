@@ -64,6 +64,35 @@ Why this instead of a real token in `.env`: see
 in a file outlives your engagement unless someone remembers to rotate it; your Azure identity being
 disabled at offboarding cuts off vault access immediately, with nothing left over to clean up.
 
+**If whoever onboarded you says this team is in "team/enterprise mode"** (i.e.
+`REQUIRE_TICKET_REFERENCE` is `"true"` in `.github/workflows/preview.yml` — ask if you're not sure),
+also add to the same `.env`:
+
+```sh
+DNSCTL_REQUIRE_TICKET_REFERENCE=true
+```
+
+This makes `dnsctl submit` reject a commit message with no ticket reference (e.g.
+`[INC0012345]`) locally, before it ever creates a branch or opens a PR — see
+[making-changes.md#team-enterprise-mode-referencing-a-ticket](making-changes.md#teamenterprise-mode-referencing-a-ticket).
+It's a convenience that saves you a round trip to the `DNS Preview` check on GitHub, not the actual
+requirement — that's enforced server-side either way, so setting it wrong or leaving it off doesn't
+let you skip the ticket, it just means you find out later instead of immediately.
+
+**If you'll ever run `dnsctl merge`** (typically the Approver role — see
+[DNS_Change_Process.md#roles-and-access](DNS_Change_Process.md#roles-and-access) — but relevant to
+anyone with merge access in team/enterprise mode), also add to the same `.env`:
+
+```sh
+DNSCTL_REQUIRE_NON_AUTHOR_REVIEW=true
+```
+
+This makes `dnsctl merge` refuse a PR with no `APPROVED` review from someone other than its author,
+before it merges — catching the same problem `apply.yml`'s own `REQUIRE_NON_AUTHOR_REVIEW` check
+would otherwise only catch *after* merge, once `DNS Apply` runs. Like the ticket-reference toggle
+above, this is a local convenience only; the actual requirement is enforced server-side regardless
+of whether you set this.
+
 ## 5. Verify everything works
 
 ```sh

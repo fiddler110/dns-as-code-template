@@ -26,10 +26,16 @@ concurrency:
 permissions:
   contents: read
   pull-requests: read
+  actions: read
+  issues: write
 
 jobs:
   apply:
     runs-on: ubuntu-latest
+    # Generous relative to the other workflows: this job makes several GitHub
+    # API calls, downloads an artifact, then runs get-zones/push/a up-to-5-min
+    # verify-retry loop against live Cloudflare.
+    timeout-minutes: 20
     # No Environment approval gate: solo/small-team project, so a
     # required-reviewer step would just block on self-approval. The PR
     # review + preview check before merge is the checkpoint instead. The
@@ -37,29 +43,101 @@ jobs:
     # server-side - see docs/security.md.
     env:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN_WRITE }}
+      # Operating mode. "true" (enterprise/team mode) requires an APPROVED
+      # review from someone other than the PR author before `push` runs -
+      # turn this on once more than one person has write access. "false"
+      # (solo-operator mode, the default here) skips that check. The check
+      # itself stays fully implemented either way - this only decides
+      # whether it's enforced.
+      REQUIRE_NON_AUTHOR_REVIEW: "false"
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Require this commit to come from a merged pull request
+        id: merged_pr
         if: github.event_name != 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          merged=$(gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/pulls" \
-            --jq '[.[] | select(.merged_at != null)] | length')
-          if [ "$merged" -eq 0 ]; then
+          pr_json=$(gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/pulls" \
+            --jq '[.[] | select(.merged_at != null)] | sort_by(.merged_at) | last // empty')
+          if [ -z "$pr_json" ]; then
             echo "::error::Commit ${{ github.sha }} has no merged pull request. Refusing to apply DNS changes."
             echo "Push DNS changes via a PR, or use the manual workflow_dispatch trigger if this is intentional."
             exit 1
           fi
+          echo "number=$(jq -r '.number' <<< "$pr_json")" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$(jq -r '.head.sha' <<< "$pr_json")" >> "$GITHUB_OUTPUT"
 
-      - name: Install dnscontrol
+      # GitHub branch protection / rulesets aren't available on every plan
+      # (see docs/security.md), so "≥1 approving review from someone other
+      # than the author" can otherwise be only a written process rule
+      # (docs/DNS_Change_Process.md), not something GitHub blocks a merge on.
+      # Enforce it here instead, same pattern as the merged-PR check above: a
+      # self-merged, unreviewed PR fails the apply rather than silently going
+      # through. Gated by REQUIRE_NON_AUTHOR_REVIEW above - off by default in
+      # a solo-operator repo, on for a team/enterprise setup.
+      - name: Require an approving review from someone other than the PR author
+        id: reviewer_approval
+        if: github.event_name != 'workflow_dispatch' && env.REQUIRE_NON_AUTHOR_REVIEW == 'true'
         env:
-          DNSCONTROL_VERSION: "4.46.0"
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          pr_number="${{ steps.merged_pr.outputs.number }}"
+          pr_author=$(gh api "repos/${{ github.repository }}/pulls/${pr_number}" --jq '.user.login')
+          approver=$(gh api "repos/${{ github.repository }}/pulls/${pr_number}/reviews" \
+            --jq --arg author "$pr_author" '
+              sort_by(.submitted_at)
+              | group_by(.user.login)
+              | map(last)
+              | map(select(.state == "APPROVED" and .user.login != $author))
+              | (last // empty) | .user.login // empty
+            ')
+          if [ -z "$approver" ]; then
+            echo "::error::PR #${pr_number} (by @${pr_author}) has no APPROVED review from anyone other than the author. Refusing to apply DNS changes without independent review."
+            exit 1
+          fi
+          echo "Approved by @${approver}."
+
+      # Confirm what's about to be pushed is what got reviewed. Live
+      # Cloudflare state (or dnsconfig.js) can change out-of-band between a
+      # PR's preview run and this apply - dnscontrol push would silently
+      # reconcile that too, under the authority of a review that never saw
+      # it. Find the DNS Preview run for the merged PR's head commit and
+      # pull down the diff it posted for review.
+      - name: Find the reviewed DNS Preview run
+        id: reviewed_preview
+        if: github.event_name != 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          head_sha="${{ steps.merged_pr.outputs.head_sha }}"
+          run_id=$(gh api "repos/${{ github.repository }}/actions/workflows/preview.yml/runs?head_sha=${head_sha}&status=completed" \
+            --jq '[.workflow_runs[]] | sort_by(.run_started_at) | last | .id // empty')
+          if [ -z "$run_id" ]; then
+            echo "::error::No completed DNS Preview run found for merged PR #${{ steps.merged_pr.outputs.number }} (head $head_sha). Refusing to apply DNS changes without a reviewed diff to verify against."
+            exit 1
+          fi
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+
+      - name: Download the reviewed preview output
+        if: github.event_name != 'workflow_dispatch'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: preview-output-${{ steps.merged_pr.outputs.head_sha }}
+          path: reviewed-preview
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.reviewed_preview.outputs.run_id }}
+
+      - name: Install dnscontrol
+        run: |
+          set -euo pipefail
+          # Single source of truth for the pinned version - see .dnscontrol-version.
+          DNSCONTROL_VERSION="$(cat .dnscontrol-version)"
           base="https://github.com/DNSControl/dnscontrol/releases/download/v${DNSCONTROL_VERSION}"
           asset="dnscontrol_${DNSCONTROL_VERSION}_linux_amd64.tar.gz"
           curl -sSLo "$asset" "${base}/${asset}"
@@ -70,7 +148,112 @@ jobs:
           dnscontrol version
 
       - name: Preview before applying
-        run: dnscontrol preview
+        run: |
+          set -o pipefail
+          dnscontrol preview 2>&1 | tee preview_output.txt
+
+      - name: Verify applied diff matches reviewed diff
+        if: github.event_name != 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          if ! diff -u reviewed-preview/preview_output.txt preview_output.txt; then
+            echo "::error::The diff about to be applied does not match the diff reviewed on PR #${{ steps.merged_pr.outputs.number }}. Live Cloudflare state (or dnsconfig.js) changed between review and apply. Refusing to push - re-review and re-merge, or investigate the drift before retrying."
+            exit 1
+          fi
+          echo "Applied diff matches the diff reviewed on PR #${{ steps.merged_pr.outputs.number }}."
+
+      # dnsconfig.js only knows what it knows - a live-only record (e.g. an
+      # in-flight _acme-challenge TXT `record prune-acme` warns it will
+      # DELETE) has no representation to revert to if this push removes it
+      # unexpectedly. Snapshot actual live state right before push so
+      # there's something to recover from beyond "revert the file and hope."
+      - name: Snapshot live zone state before push
+        run: |
+          set -euo pipefail
+          # Keep this zone list in sync with ZONES in scripts/dnsctl.py and
+          # the D("...", ...) blocks in dnsconfig.js.
+          for zone in example.com example.org; do
+            dnscontrol get-zones --format=js --out="pre-apply-snapshot-${zone}.js" cloudflare "$zone"
+          done
+
+      - name: Upload pre-apply zone snapshot
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: pre-apply-snapshot-${{ github.sha }}-${{ github.run_id }}
+          path: pre-apply-snapshot-*.js
+          retention-days: 14
 
       - name: Run dnscontrol push
-        run: dnscontrol push
+        run: |
+          set -o pipefail
+          dnscontrol push 2>&1 | tee push_output.txt
+
+      # dnscontrol push exiting 0 doesn't guarantee live Cloudflare state
+      # actually matches dnsconfig.js afterward (this is the same check
+      # `dnsctl validate`/`merge --wait` already do locally, just never
+      # automatically here). Retry for up to 5 minutes rather than checking
+      # once, since a transient read-after-write hiccup shouldn't be
+      # indistinguishable from a real partial apply.
+      - name: Verify DNS apply took effect
+        run: |
+          set -o pipefail
+          deadline=$((SECONDS + 300))
+          while true; do
+            if dnscontrol preview --expect-no-changes 2>&1 | tee verify_output.txt; then
+              echo "Verified: live Cloudflare state matches dnsconfig.js."
+              exit 0
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::dnscontrol push succeeded, but live Cloudflare state still didn't match dnsconfig.js after retrying for 5 minutes. Manual validation required - see docs/operations.md#responding-to-detected-drift."
+              exit 1
+            fi
+            sleep 15
+          done
+
+      - name: File or update apply-failure issue
+        if: failure()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- dns-apply-failure-tracking-issue -->';
+            const title = 'DNS Apply failed';
+
+            let output = '_No output was captured - the workflow failed before either the push or verify step ran. See the workflow log._';
+            let stage = 'an earlier step';
+            if (fs.existsSync('verify_output.txt')) {
+              output = fs.readFileSync('verify_output.txt', 'utf8').slice(0, 60000);
+              stage = 'post-apply verification (dnscontrol push succeeded, but live state still did not match dnsconfig.js after retrying for 5 minutes - manual validation required)';
+            } else if (fs.existsSync('push_output.txt')) {
+              output = fs.readFileSync('push_output.txt', 'utf8').slice(0, 60000);
+              stage = 'dnscontrol push';
+            }
+
+            const body = `${marker}\n### DNS Apply failed\n\nFailed at: **${stage}**.\n\nRun: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\n\`\`\`\n${output}\n\`\`\``;
+
+            const existing = await github.rest.search.issuesAndPullRequests({
+              q: `repo:${context.repo.owner}/${context.repo.repo} is:issue is:open in:body "${marker}"`,
+            });
+
+            if (existing.data.items.length > 0) {
+              const issue = existing.data.items[0];
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body,
+              });
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: `DNS Apply failed again: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+              });
+            }

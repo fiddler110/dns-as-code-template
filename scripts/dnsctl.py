@@ -14,6 +14,7 @@ Commands:
     doctor              Check that the local environment is set up correctly.
     setup               One-time local setup: git hook + .env scaffold.
     install-dnscontrol  Download the pinned dnscontrol release for this OS/arch.
+    begin               Start a new change: sync main, check for drift, create a branch.
     preview             Run `dnscontrol preview` (loads .env automatically).
     push                Run `dnscontrol push` (requires confirmation).
     import              Snapshot the live Cloudflare zone to a JS file for
@@ -26,6 +27,8 @@ Commands:
     merge               Merge a PR once its DNS Preview check has passed.
     validate            Confirm a merged change's DNS Apply run succeeded and live
                          Cloudflare matches dnsconfig.js.
+    history             Show recent applied changes from git log.
+    rollback            Revert a previous change via a new PR.
     record add          Interactively add a record to dnsconfig.js, e.g.
                          `record add plex.example.com`.
     record remove       Interactively remove a record from dnsconfig.js.
@@ -36,6 +39,8 @@ Commands:
     record sync-acme    Fold live Cloudflare's _acme-challenge TXT records into
                          dnsconfig.js (add missing, remove stale).
     lint                Fast offline sanity checks on dnsconfig.js.
+    fmt                 Re-sort each zone block in dnsconfig.js into canonical
+                         record-type order (A, CNAME, MX, TXT, CAA).
     show                Table view of all records (terminal, CSV, or Markdown).
 
 The submit/status/review/approve/merge commands require the GitHub CLI
@@ -69,48 +74,69 @@ from pathlib import Path
 # does - neither guarantees scripts/ is already on sys.path.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from dnsctl_lib import install, procutil, records, render  # noqa: E402
-from dnsctl_lib import env as env_lib  # noqa: E402
-from dnsctl_lib.env import load_env_file  # noqa: E402
-from dnsctl_lib.cli_utils import (  # noqa: E402
+from dnsctl_lib import env as env_lib
+from dnsctl_lib import install, procutil, records, render
+from dnsctl_lib.cli_utils import (
+    RECORD_VALUE_LABELS,
+    confirm_or_abort,
+    ensure_trailing_dot,
     eprint,
+    find_non_author_approval,
+    get_dnsctl_setting,
     parse_index_arg,
     prompt,
     prompt_yes_no,
+    resolve_zone_arg,
     slugify,
+    split_pr_checks,
 )
-from dnsctl_lib.procutil import (  # noqa: E402
+from dnsctl_lib.env import has_cloudflare_token, load_env_file, require_cloudflare_token
+from dnsctl_lib.procutil import (
     exe_name,
     find_dnscontrol,
+    gh,
     git,
     git_output,
-    gh,
     have_gh,
+    require_clean_worktree,
     require_gh,
     run_dnscontrol,
 )
-from dnsctl_lib.records import (  # noqa: E402
+from dnsctl_lib.records import (
+    CAA_TAGS,
+    HOSTNAME_VALUE_TYPES,
     RECORD_LINE_PATTERN,
+    TTL_MAX,
+    TTL_MIN,
     build_record_line,
     classify_zone_line,
+    format_zone_block_lines,
     fqdn_for,
+    is_valid_ipv4,
     parse_record_line_full,
-    split_top_level_args,
 )
 
-# Keep in sync with DNSCONTROL_VERSION in .github/workflows/preview.yml and apply.yml.
-DNSCONTROL_VERSION = "4.46.0"
 CREDKEY = "cloudflare"
 # Every zone managed in dnsconfig.js. Keep this in sync with the D("...", ...)
 # blocks there - the record wizard needs it to figure out which zone a given
 # name belongs to (and to require --zone when a bare relative name is ambiguous).
 ZONES = ["example.com", "example.org"]
 
+# CI-14's local mirror: must match TICKET_REFERENCE_PATTERN's default in
+# .github/workflows/preview.yml so a message that passes this local check
+# also passes CI, unless DNSCTL_TICKET_REFERENCE_PATTERN overrides it.
+DEFAULT_TICKET_REFERENCE_PATTERN = r"\[[A-Z][A-Z0-9]*-?[0-9]+\]"
+
 REPO_ROOT = procutil.REPO_ROOT
 ENV_FILE = REPO_ROOT / ".env"
 ENV_EXAMPLE = REPO_ROOT / ".env.example"
 CREDS_FILE = REPO_ROOT / "creds.json"
 DNSCONFIG_FILE = REPO_ROOT / "dnsconfig.js"
+# Single source of truth for the pinned dnscontrol version (CI-13) - every
+# workflow in .github/workflows/ reads this same file instead of hardcoding
+# the value independently. Bumping the version means editing this one file.
+DNSCONTROL_VERSION_FILE = REPO_ROOT / ".dnscontrol-version"
+DNSCONTROL_VERSION = DNSCONTROL_VERSION_FILE.read_text(encoding="utf-8").strip()
 
 
 def load_cloudflare_env(env_file: Path = ENV_FILE) -> dict:
@@ -128,9 +154,34 @@ def parse_record_target(spec: str, zone: str | None = None) -> tuple[str, str]:
     return records.parse_record_target(spec, ZONES, zone=zone)
 
 
-def find_zone_block(zone: str) -> tuple[int, int]:
-    """Return (start, end) line indices of D("zone", ...) ... ); in dnsconfig.js."""
-    lines = DNSCONFIG_FILE.read_text(encoding="utf-8").splitlines()
+def read_dnsconfig_lines() -> list[str]:
+    """Read and split dnsconfig.js once. Callers that need to look at more than
+    one zone/helper within the same command should call this once and thread
+    the result through (via `lines`) instead of each helper re-reading the
+    file itself (TOOL-13)."""
+    return DNSCONFIG_FILE.read_text(encoding="utf-8").splitlines()
+
+
+def write_dnsconfig_lines(lines: list[str]) -> None:
+    """Write dnsconfig.js atomically: write the new content to a temp file in
+    the same directory, then os.replace() it into place. A crash or kill
+    partway through only ever leaves the temp file incomplete - dnsconfig.js
+    itself is either the old content or the new content, never truncated."""
+    fd, tmp_path = tempfile.mkstemp(
+        suffix=".tmp", prefix="dnsconfig-", dir=DNSCONFIG_FILE.parent
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        os.replace(tmp_path, DNSCONFIG_FILE)
+    except BaseException:
+        Path(tmp_path).unlink(missing_ok=True)
+        raise
+
+
+def find_zone_block(lines: list[str], zone: str) -> tuple[int, int]:
+    """Return (start, end) line indices of D("zone", ...) ... ); within
+    `lines` (dnsconfig.js content the caller already read)."""
     return records.find_zone_block_in_lines(lines, zone, source_name=DNSCONFIG_FILE.name)
 
 
@@ -148,7 +199,7 @@ def fetch_live_acme_snapshot(zone: str, env: dict) -> list[dict] | None:
         if rc != 0:
             return None
         lines = Path(tmp_path).read_text(encoding="utf-8").splitlines()
-        start, end = find_zone_block_in_lines(lines, zone, source_name="the live snapshot")
+        start, end = records.find_zone_block_in_lines(lines, zone, source_name="the live snapshot")
         live = []
         for i in range(start + 1, end):
             parsed = parse_record_line_full(lines[i])
@@ -172,11 +223,11 @@ def fetch_live_acme_entries(zone: str, env: dict) -> set[tuple[str, str]] | None
     return {(p["name"], p["value"]) for p in snapshot}
 
 
-def local_acme_entries(zone: str) -> list[tuple[int, str, dict]]:
+def local_acme_entries(lines: list[str], zone: str) -> list[tuple[int, str, dict]]:
     """(index, line, parsed) for every _acme-challenge TXT line in `zone`'s
-    D(...) block in dnsconfig.js, current file state."""
-    start, end = find_zone_block(zone)
-    lines = DNSCONFIG_FILE.read_text(encoding="utf-8").splitlines()
+    D(...) block within `lines` (dnsconfig.js content the caller already
+    read)."""
+    start, end = find_zone_block(lines, zone)
     out = []
     for i in range(start + 1, end):
         parsed = parse_record_line_full(lines[i])
@@ -190,12 +241,12 @@ def local_acme_entries(zone: str) -> list[tuple[int, str, dict]]:
 
 
 def find_record_lines(
-    name: str, zone: str, record_type: str | None = None
+    lines: list[str], name: str, zone: str, record_type: str | None = None
 ) -> list[tuple[int, str]]:
     """Find matching record lines within `zone`'s D(...) block only - not the whole file,
-    since the same relative name can validly exist in more than one zone's block."""
-    start, end = find_zone_block(zone)
-    lines = DNSCONFIG_FILE.read_text(encoding="utf-8").splitlines()
+    since the same relative name can validly exist in more than one zone's block. `lines`
+    is dnsconfig.js content the caller already read."""
+    start, end = find_zone_block(lines, zone)
     matches = []
     for i in range(start + 1, end):
         m = RECORD_LINE_PATTERN.match(lines[i])
@@ -210,25 +261,30 @@ def find_record_lines(
     return matches
 
 
-def insert_record_line(line: str, zone: str) -> None:
-    _, end = find_zone_block(zone)
-    lines = DNSCONFIG_FILE.read_text(encoding="utf-8").splitlines()
+def insert_record_line(lines: list[str], line: str, zone: str) -> None:
+    """Insert `line` at the end of `zone`'s D(...) block and write it out.
+    `lines` is dnsconfig.js content the caller already read - mutated in
+    place, so callers must not reuse stale indices into it afterwards."""
+    _, end = find_zone_block(lines, zone)
     lines.insert(end, line)
-    DNSCONFIG_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    write_dnsconfig_lines(lines)
 
 
-def remove_line_at(index: int) -> None:
-    lines = DNSCONFIG_FILE.read_text(encoding="utf-8").splitlines()
+def remove_line_at(lines: list[str], index: int) -> None:
+    """Delete `lines[index]` and write it out. `lines` is dnsconfig.js content
+    the caller already read - mutated in place, so callers removing multiple
+    indices from the same read must go highest-to-lowest."""
     del lines[index]
-    DNSCONFIG_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    write_dnsconfig_lines(lines)
 
 
-def replace_line_at(index: int, new_line: str) -> None:
-    """Overwrite one line in place. Safe to call once per index computed from
-    the same read - unlike insert/remove, this never shifts other line numbers."""
-    lines = DNSCONFIG_FILE.read_text(encoding="utf-8").splitlines()
+def replace_line_at(lines: list[str], index: int, new_line: str) -> None:
+    """Overwrite one line in place and write it out. `lines` is dnsconfig.js
+    content the caller already read. Safe to call once per index computed
+    from the same read - unlike insert/remove, this never shifts other line
+    numbers."""
     lines[index] = new_line
-    DNSCONFIG_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    write_dnsconfig_lines(lines)
 
 
 def offer_preview_and_submit(default_message: str, interactive: bool) -> None:
@@ -264,10 +320,14 @@ def cmd_doctor(_args) -> int:
 
     dnscontrol = find_dnscontrol()
     if dnscontrol:
-        version_proc = subprocess.run(
-            [dnscontrol, "version"], capture_output=True, text=True
-        )
-        version = version_proc.stdout.strip() or version_proc.stderr.strip()
+        try:
+            version_proc = subprocess.run(
+                [dnscontrol, "version"], capture_output=True, text=True, check=False, timeout=15
+            )
+            version = version_proc.stdout.strip() or version_proc.stderr.strip()
+        except subprocess.TimeoutExpired:
+            eprint(f"[warn] '{dnscontrol} version' timed out after 15s.")
+            version = "(timed out - could not check)"
         print(f"[ok]   dnscontrol found: {dnscontrol} ({version})")
         if DNSCONTROL_VERSION not in version:
             print(
@@ -330,12 +390,23 @@ def cmd_doctor(_args) -> int:
         print("[FAIL] creds.json not found.")
         ok = False
 
-    hooks_path = subprocess.run(
-        ["git", "config", "--get", "core.hooksPath"],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
+    if have_gh():
+        print("[ok]   GitHub CLI ('gh') found on PATH.")
+    else:
+        print(
+            "[warn] GitHub CLI ('gh') not found on PATH - submit, status, review, approve, "
+            "merge, begin, rollback, and validate all need it. Install it: "
+            "https://cli.github.com/"
+        )
+
+    if vault and not shutil.which("az"):
+        print(
+            f"[warn] CLOUDFLARE_KEYVAULT_NAME='{vault}' is set but Azure CLI ('az') is not "
+            "found on PATH - the Key Vault token fetch above will fail. Install it: "
+            "https://learn.microsoft.com/cli/azure/install-azure-cli"
+        )
+
+    hooks_path = git_output(["config", "--get", "core.hooksPath"])
     if hooks_path in (".githooks", str(REPO_ROOT / ".githooks")):
         print(f"[ok]   git hooks path is set to '{hooks_path}'.")
     else:
@@ -354,7 +425,7 @@ def cmd_doctor(_args) -> int:
 def cmd_setup(_args) -> int:
     print("Setting up local environment...")
 
-    subprocess.run(["git", "config", "core.hooksPath", ".githooks"], cwd=REPO_ROOT, check=True)
+    git(["config", "core.hooksPath", ".githooks"], check=True)
     print("[ok] git core.hooksPath set to .githooks")
 
     if ENV_FILE.is_file():
@@ -424,9 +495,12 @@ def cmd_install_dnscontrol(args) -> int:
 
     print(f"Extracting dnscontrol binary to {dest_path} ...")
     if asset.endswith(".zip"):
-        with zipfile.ZipFile(tmp_archive) as zf:
-            with zf.open(exe_name("dnscontrol")) as src, open(dest_path, "wb") as dst:
-                shutil.copyfileobj(src, dst)
+        with (
+            zipfile.ZipFile(tmp_archive) as zf,
+            zf.open(exe_name("dnscontrol")) as src,
+            open(dest_path, "wb") as dst,
+        ):
+            shutil.copyfileobj(src, dst)
     else:
         with tarfile.open(tmp_archive, "r:gz") as tf:
             member = tf.getmember("dnscontrol")
@@ -448,17 +522,17 @@ def cmd_install_dnscontrol(args) -> int:
 
 def cmd_preview(_args) -> int:
     env = load_cloudflare_env()
-    if "CLOUDFLARE_API_TOKEN" not in env and "CLOUDFLARE_API_TOKEN" not in os.environ:
-        eprint("error: CLOUDFLARE_API_TOKEN not set in .env, the environment, or Key Vault.")
-        eprint("       Run: python scripts/dnsctl.py setup")
+    if not require_cloudflare_token(env, "       Run: python scripts/dnsctl.py setup"):
         return 1
     return run_dnscontrol(["preview"], env)
 
 
 def cmd_push(args) -> int:
     env = load_cloudflare_env()
-    if "CLOUDFLARE_API_TOKEN" not in env and "CLOUDFLARE_API_TOKEN" not in os.environ:
-        eprint("error: CLOUDFLARE_API_TOKEN not set in .env, the environment, or Key Vault.")
+    if not require_cloudflare_token(env):
+        return 1
+
+    if not require_clean_worktree("pushing directly to live Cloudflare"):
         return 1
 
     print(
@@ -469,11 +543,11 @@ def cmd_push(args) -> int:
         "the write token to be set yourself for this one command (e.g. via "
         "CLOUDFLARE_API_TOKEN_WRITE in .env) - see docs/security.md before doing this."
     )
-    if not args.yes:
-        confirm = input('Type "APPLY" to continue, anything else to abort: ')
-        if confirm != "APPLY":
-            print("Aborted.")
-            return 1
+    if not args.yes and not confirm_or_abort(
+        'Type "APPLY" to continue, anything else to abort: ', "APPLY"
+    ):
+        print("Aborted.")
+        return 1
 
     write_token = env.get("CLOUDFLARE_API_TOKEN_WRITE") or os.environ.get(
         "CLOUDFLARE_API_TOKEN_WRITE"
@@ -487,8 +561,7 @@ def cmd_push(args) -> int:
 
 def cmd_import(args) -> int:
     env = load_cloudflare_env()
-    if "CLOUDFLARE_API_TOKEN" not in env and "CLOUDFLARE_API_TOKEN" not in os.environ:
-        eprint("error: CLOUDFLARE_API_TOKEN not set in .env, the environment, or Key Vault.")
+    if not require_cloudflare_token(env):
         return 1
 
     zone = args.zone
@@ -498,8 +571,7 @@ def cmd_import(args) -> int:
         else:
             eprint(f"error: --zone is required (this project manages: {', '.join(ZONES)}).")
             return 1
-    elif zone not in ZONES:
-        eprint(f"error: '{zone}' is not a zone this project manages ({', '.join(ZONES)}).")
+    elif not resolve_zone_arg(zone, ZONES):
         return 1
 
     out_path = args.out
@@ -524,6 +596,30 @@ def cmd_submit(args) -> int:
         eprint("error: no local changes to commit.")
         return 1
 
+    # CI-14 local mirror: fails fast, before touching git at all, instead of
+    # making the contractor wait for the DNS Preview check on GitHub to tell
+    # them the same thing. Purely a convenience layer - toggled independently
+    # via .env, off by default (solo-operator mode). The actual enforcement
+    # is still the "Require a ticket reference on this PR" step in
+    # preview.yml (REQUIRE_TICKET_REFERENCE) - this local check has no way to
+    # stop someone from pushing straight past it (--no-verify-equivalent: just
+    # don't set the .env var), so treat it as a fast-feedback nicety, not a
+    # substitute for the CI gate. See docs/making-changes.md#team-enterprise-mode.
+    local_env = load_env_file(ENV_FILE) if ENV_FILE.is_file() else {}
+    if get_dnsctl_setting(local_env, "DNSCTL_REQUIRE_TICKET_REFERENCE").strip().lower() == "true":
+        pattern = get_dnsctl_setting(local_env, "DNSCTL_TICKET_REFERENCE_PATTERN") or DEFAULT_TICKET_REFERENCE_PATTERN
+        haystack = f"{args.message}\n{args.body or ''}"
+        if not re.search(pattern, haystack):
+            eprint(
+                f"error: no ticket reference matching pattern '{pattern}' found in the "
+                "message or --body. DNSCTL_REQUIRE_TICKET_REFERENCE is set to 'true' in .env "
+                "(team/enterprise mode) - open a DNS change request issue if you don't have a "
+                "ticket yet, then put its ID in the message, e.g.:\n"
+                '  python scripts/dnsctl.py submit "[INC0012345] Add CNAME for myapp"\n'
+                "See docs/making-changes.md#team-enterprise-mode-referencing-a-ticket."
+            )
+            return 1
+
     if not args.skip_preview:
         print("Running dnscontrol preview to sanity-check your change before committing...\n")
         rc = cmd_preview(args)
@@ -531,11 +627,11 @@ def cmd_submit(args) -> int:
         if rc != 0:
             eprint("error: dnscontrol preview failed - fix the error above before submitting.")
             return 1
-        if not args.yes:
-            confirm = input("Does the diff above look correct? [y/N]: ").strip().lower()
-            if confirm != "y":
-                print("Aborted.")
-                return 1
+        if not args.yes and not confirm_or_abort(
+            "Does the diff above look correct? [y/N]: ", "y", normalize=True
+        ):
+            print("Aborted.")
+            return 1
 
     current_branch = git_output(["rev-parse", "--abbrev-ref", "HEAD"])
     base_branch = args.base
@@ -551,24 +647,34 @@ def cmd_submit(args) -> int:
         branch = current_branch
         print(f"Already on branch '{branch}' - using it.")
 
+    def abandon_created_branch() -> None:
+        # Only ever undoes a branch this same invocation just created above -
+        # never touches a branch the caller was already on.
+        if created_branch:
+            git(["checkout", base_branch])
+            git(["branch", "-D", branch])
+
     files = args.files or ["dnsconfig.js"]
     git(["add", *files])
 
     staged = git_output(["diff", "--cached", "--name-only"])
     if not staged:
         eprint(f"error: nothing staged from {files} - check --files matches your edited file(s).")
-        if created_branch:
-            git(["checkout", base_branch])
-            git(["branch", "-D", branch])
+        abandon_created_branch()
         return 1
 
     print(f"Staged: {', '.join(staged.splitlines())}")
 
     if git(["commit", "-m", args.message]).returncode != 0:
+        eprint(
+            "error: git commit failed (see above, e.g. a pre-commit hook rejected it) - "
+            "fix the issue and re-run submit; your changes are still staged."
+        )
+        abandon_created_branch()
         return 1
 
     print(f"Pushing '{branch}'...")
-    push_result = subprocess.run(["git", "push", "-u", "origin", branch], cwd=REPO_ROOT)
+    push_result = git(["push", "-u", "origin", branch])
     if push_result.returncode != 0:
         eprint("error: git push failed (see above).")
         return push_result.returncode
@@ -614,10 +720,7 @@ def cmd_status(_args) -> int:
 
     for pr in prs:
         checks = pr.get("statusCheckRollup") or []
-        preview_checks = [
-            c for c in checks
-            if "preview" in (c.get("name") or c.get("context") or "").lower()
-        ]
+        preview_checks, other_failed = split_pr_checks(checks)
         if preview_checks:
             states = sorted({
                 (c.get("conclusion") or c.get("state") or "unknown") for c in preview_checks
@@ -630,6 +733,11 @@ def cmd_status(_args) -> int:
         print(f"#{pr['number']}{draft}: {pr['title']}")
         print(f"    branch: {pr['headRefName']}")
         print(f"    DNS Preview: {check_state}")
+        if other_failed:
+            names = ", ".join(
+                sorted({c.get("name") or c.get("context") or "unknown check" for c in other_failed})
+            )
+            print(f"    other failing checks: {names}")
         print(f"    {pr['url']}")
     return 0
 
@@ -694,7 +802,9 @@ def cmd_merge(args) -> int:
 
     number = str(args.pr)
 
-    view_result = gh(["pr", "view", number, "--json", "state,statusCheckRollup,title"])
+    view_result = gh(
+        ["pr", "view", number, "--json", "state,statusCheckRollup,title,author,reviews"]
+    )
     if view_result.returncode != 0:
         eprint(view_result.stderr.strip())
         return view_result.returncode
@@ -704,13 +814,44 @@ def cmd_merge(args) -> int:
         eprint(f"error: PR #{number} is not open (state: {data.get('state')}).")
         return 1
 
+    # CI-17 local mirror of SEC-8's REQUIRE_NON_AUTHOR_REVIEW (apply.yml):
+    # that check only runs *after* merge, so a self-approved/unreviewed PR
+    # merges fine and only fails once DNS Apply runs - leaving main merged
+    # but not applied. Checking here catches the same problem before merge
+    # instead, when it's still cheap to fix (get a review, don't merge yet).
+    # Off by default (solo-operator mode) like every other team/enterprise
+    # toggle here; not itself the enforcement - REQUIRE_NON_AUTHOR_REVIEW in
+    # apply.yml remains the real gate since .env never reaches CI.
+    local_env = load_env_file(ENV_FILE) if ENV_FILE.is_file() else {}
+    if get_dnsctl_setting(local_env, "DNSCTL_REQUIRE_NON_AUTHOR_REVIEW").strip().lower() == "true":
+        author_login = (data.get("author") or {}).get("login")
+        approver = find_non_author_approval(data.get("reviews") or [], author_login)
+        if not approver:
+            eprint(
+                f"error: PR #{number} (by @{author_login}) has no APPROVED review from "
+                "anyone other than the author. DNSCTL_REQUIRE_NON_AUTHOR_REVIEW is set to "
+                "'true' in .env (team/enterprise mode) - ask a teammate to review and "
+                "approve this PR before merging."
+            )
+            if not args.force:
+                return 1
+            print("warning: --force set, merging anyway.")
+
     checks = data.get("statusCheckRollup") or []
-    preview_checks = [
-        c for c in checks
-        if "preview" in (c.get("name") or c.get("context") or "").lower()
-    ]
+    preview_checks, other_failed = split_pr_checks(checks)
     if not preview_checks:
-        print("warning: no 'DNS Preview' check found yet on this PR.")
+        # No DNS Preview check present at all (not yet run, or misconfigured)
+        # is exactly as dangerous as one that failed - merging here means
+        # nothing has confirmed what this change will do to live Cloudflare.
+        # Require --force the same as every other failed gate below.
+        eprint(
+            f"error: no 'DNS Preview' check found yet on PR #{number} - it may still be "
+            "running, or the workflow isn't configured for this PR. Wait for it, or check "
+            "the Actions tab."
+        )
+        if not args.force:
+            return 1
+        print("warning: --force set, merging anyway.")
     else:
         failed = [c for c in preview_checks if (c.get("conclusion") or c.get("state")) != "SUCCESS"]
         if failed:
@@ -722,20 +863,29 @@ def cmd_merge(args) -> int:
                 return 1
             print("warning: --force set, merging anyway.")
 
+    # SEC-11: don't just look at the preview check - lint/test/etc. can be
+    # failing at the same time and this used to say nothing about them.
+    if other_failed:
+        names = ", ".join(
+            sorted({c.get("name") or c.get("context") or "unknown check" for c in other_failed})
+        )
+        eprint(f"error: PR #{number} has failing checks other than DNS Preview: {names}")
+        if not args.force:
+            return 1
+        print("warning: --force set, merging anyway.")
+
     print(f'PR #{number}: "{data.get("title")}"')
     print(
         "Merging will trigger the 'DNS Apply' GitHub Actions workflow, which applies "
         f"this change to the live Cloudflare zone(s) managed here ({', '.join(ZONES)})."
     )
-    if not args.yes:
-        confirm = input('Type "MERGE" to continue, anything else to abort: ')
-        if confirm != "MERGE":
-            print("Aborted.")
-            return 1
+    if not args.yes and not confirm_or_abort(
+        'Type "MERGE" to continue, anything else to abort: ', "MERGE"
+    ):
+        print("Aborted.")
+        return 1
 
-    result = subprocess.run(
-        ["gh", "pr", "merge", number, "--merge", "--delete-branch"], cwd=REPO_ROOT
-    )
+    result = gh(["pr", "merge", number, "--merge", "--delete-branch"], capture=False)
     if result.returncode != 0:
         return result.returncode
 
@@ -756,34 +906,23 @@ def cmd_begin(args) -> int:
     if not require_gh():
         return 1
 
-    status = git_output(["status", "--porcelain"])
-    if status:
-        eprint(
-            "error: you have uncommitted changes - commit, stash, or discard them "
-            "before starting a new DNS change:"
-        )
-        eprint(status)
+    if not require_clean_worktree("starting a new DNS change"):
         return 1
 
     base = args.base
-    current_branch = git_output(["rev-parse", "--abbrev-ref", "HEAD"])
-    if current_branch != base:
-        print(f"Switching from '{current_branch}' to '{base}'...")
-        if git(["checkout", base]).returncode != 0:
-            return 1
-
-    print(f"Fetching latest '{base}' from origin...")
-    if git(["fetch", "origin", base]).returncode != 0:
-        return 1
-    if git(["pull", "--ff-only", "origin", base]).returncode != 0:
-        eprint(
+    if not procutil.sync_branch(
+        base,
+        switch_message="Switching from '{current_branch}' to '{branch}'...",
+        fetch_message="Fetching latest '{branch}' from origin...",
+        diverged_message=(
             f"error: '{base}' could not be fast-forwarded to origin/{base}. "
             "Your local branch has diverged - resolve manually (do not force) before continuing."
-        )
+        ),
+    ):
         return 1
 
     env = load_cloudflare_env()
-    have_token = "CLOUDFLARE_API_TOKEN" in env or "CLOUDFLARE_API_TOKEN" in os.environ
+    have_token = has_cloudflare_token(env)
     if have_token:
         print(
             f"\nChecking '{base}' matches live Cloudflare state "
@@ -892,13 +1031,7 @@ def cmd_rollback(args) -> int:
     if not require_gh():
         return 1
 
-    status = git_output(["status", "--porcelain"])
-    if status:
-        eprint(
-            "error: you have uncommitted changes - commit, stash, or discard them "
-            "before starting a rollback:"
-        )
-        eprint(status)
+    if not require_clean_worktree("starting a rollback"):
         return 1
 
     resolved = resolve_revert_target(args.target)
@@ -907,14 +1040,7 @@ def cmd_rollback(args) -> int:
     target_sha, is_merge = resolved
 
     base = "main"
-    current_branch = git_output(["rev-parse", "--abbrev-ref", "HEAD"])
-    if current_branch != base:
-        if git(["checkout", base]).returncode != 0:
-            return 1
-    if git(["fetch", "origin", base]).returncode != 0:
-        return 1
-    if git(["pull", "--ff-only", "origin", base]).returncode != 0:
-        eprint(f"error: '{base}' could not be fast-forwarded to origin/{base}.")
+    if not procutil.sync_branch(base):
         return 1
 
     subject = git_output(["log", "-1", "--pretty=format:%s", target_sha])
@@ -943,16 +1069,15 @@ def cmd_rollback(args) -> int:
         eprint("error: dnscontrol preview failed on the revert - investigate before submitting.")
         return 1
 
-    if not args.yes:
-        confirm = input(
-            "Does the diff above look like the exact inverse of the original change? [y/N]: "
-        ).strip().lower()
-        if confirm != "y":
-            print(f"Aborted - branch '{branch}' left in place for manual inspection.")
-            return 1
+    if not args.yes and not confirm_or_abort(
+        "Does the diff above look like the exact inverse of the original change? [y/N]: ",
+        "y", normalize=True,
+    ):
+        print(f"Aborted - branch '{branch}' left in place for manual inspection.")
+        return 1
 
     print(f"Pushing '{branch}'...")
-    push_result = subprocess.run(["git", "push", "-u", "origin", branch], cwd=REPO_ROOT)
+    push_result = git(["push", "-u", "origin", branch])
     if push_result.returncode != 0:
         eprint("error: git push failed (see above).")
         return push_result.returncode
@@ -987,30 +1112,17 @@ def sync_local_main() -> bool:
     Cloudflare against whatever dnsconfig.js is on disk; running it from a
     stale or unrelated branch would otherwise report phantom drift that's
     actually just local/main being out of sync, not a real problem."""
-    status = git_output(["status", "--porcelain"])
-    if status:
-        eprint(
-            "error: you have uncommitted changes - commit, stash, or discard them "
-            "before running validate (it needs to sync 'main' to compare against):"
-        )
-        eprint(status)
+    if not require_clean_worktree("running validate (it needs to sync 'main' to compare against)"):
         return False
 
-    current_branch = git_output(["rev-parse", "--abbrev-ref", "HEAD"])
-    if current_branch != "main":
-        print(f"Switching from '{current_branch}' to 'main' to compare against its dnsconfig.js...")
-        if git(["checkout", "main"]).returncode != 0:
-            return False
-
-    if git(["fetch", "origin", "main"]).returncode != 0:
-        return False
-    if git(["pull", "--ff-only", "origin", "main"]).returncode != 0:
-        eprint(
+    return procutil.sync_branch(
+        "main",
+        switch_message="Switching from '{current_branch}' to 'main' to compare against its dnsconfig.js...",
+        diverged_message=(
             "error: 'main' could not be fast-forwarded to origin/main - your local "
             "main has diverged. Resolve manually (do not force) before running validate."
-        )
-        return False
-    return True
+        ),
+    )
 
 
 # Keep in sync with the `paths:` filter in .github/workflows/apply.yml - a
@@ -1104,7 +1216,11 @@ def validate_apply(target: str | None, timeout: int) -> int:
             time.sleep(5)
 
         print(f"Found run {run_id} - waiting for it to complete...\n")
-        watch = subprocess.run(["gh", "run", "watch", str(run_id), "--exit-status"], cwd=REPO_ROOT)
+        # gh run watch is legitimately watching a CI run to completion, which
+        # can take much longer than a quick API call - reuse the same
+        # --timeout budget the caller already controls (see the "no run
+        # found yet" wait above) instead of the short default gh() timeout.
+        watch = gh(["run", "watch", str(run_id), "--exit-status"], capture=False, timeout=timeout)
         if watch.returncode != 0:
             eprint(f"\nerror: 'DNS Apply' run {run_id} did not succeed - see {run_url}")
             return 1
@@ -1145,11 +1261,11 @@ def cmd_record_add(args) -> int:
         if not interactive:
             eprint("error: --yes requires --type to be provided (no prompts allowed).")
             return 1
-        record_type = prompt("Record type (A, CNAME, MX, TXT)", default="CNAME").upper()
-    if record_type not in ("A", "CNAME", "MX", "TXT"):
+        record_type = prompt("Record type (A, CNAME, MX, TXT, CAA)", default="CNAME").upper()
+    if record_type not in ("A", "CNAME", "MX", "TXT", "CAA"):
         eprint(
             f"error: unsupported record type '{record_type}'. This wizard supports "
-            "A, CNAME, MX, TXT - edit dnsconfig.js directly for anything else "
+            "A, CNAME, MX, TXT, CAA - edit dnsconfig.js directly for anything else "
             "(see docs/record-types.md)."
         )
         return 1
@@ -1158,26 +1274,17 @@ def cmd_record_add(args) -> int:
     priority = args.priority
     proxy = args.proxy
     ttl = args.ttl
+    tag = args.tag
 
     if value is None:
         if not interactive:
             eprint("error: --yes requires --value to be provided (no prompts allowed).")
             return 1
-        label = {
-            "A": "IPv4 address",
-            "CNAME": "target hostname",
-            "MX": "mail server hostname",
-            "TXT": "text value",
-        }[record_type]
+        label = RECORD_VALUE_LABELS[record_type]
         value = prompt(f"{label} for {fqdn_for(name, zone)}")
 
-    if record_type in ("CNAME", "MX") and value and not value.endswith("."):
-        if interactive:
-            if prompt_yes_no(f"'{value}' has no trailing dot - add one?", default_yes=True):
-                value += "."
-        else:
-            value += "."
-            print(f"note: appended trailing dot -> {value}")
+    if record_type in ("CNAME", "MX"):
+        value = ensure_trailing_dot(value, interactive)
 
     if record_type == "MX" and priority is None:
         if not interactive:
@@ -1192,20 +1299,31 @@ def cmd_record_add(args) -> int:
             proxy = True
             print("note: defaulting to proxy ON (pass --no-proxy to disable)")
 
+    if record_type == "CAA" and tag is None:
+        if not interactive:
+            eprint("error: --yes with a CAA record requires --tag (issue, issuewild, or iodef).")
+            return 1
+        tag = prompt(f"CAA tag ({'/'.join(CAA_TAGS)})", default="issue")
+    if record_type == "CAA" and tag not in CAA_TAGS:
+        eprint(f"error: CAA tag must be one of {', '.join(CAA_TAGS)} - got '{tag}'.")
+        return 1
+
     if record_type == "TXT" and ttl is None and interactive:
         ttl_input = prompt("TTL override in seconds (blank = zone default)", default="")
         ttl = int(ttl_input) if ttl_input else None
 
     try:
         line = build_record_line(
-            record_type, name, value, priority=priority, proxy=proxy, ttl=ttl
+            record_type, name, value, priority=priority, proxy=proxy, ttl=ttl,
+            tag=tag if record_type == "CAA" else None,
         )
     except ValueError as e:
         eprint(f"error: {e}")
         return 1
 
-    start, end = find_zone_block(zone)
-    zone_lines = DNSCONFIG_FILE.read_text(encoding="utf-8").splitlines()[start + 1 : end]
+    lines = read_dnsconfig_lines()
+    start, end = find_zone_block(lines, zone)
+    zone_lines = lines[start + 1 : end]
     if line.strip() in {existing_line.strip() for existing_line in zone_lines}:
         eprint(
             f"error: this exact record already exists in the {zone} block of "
@@ -1214,11 +1332,13 @@ def cmd_record_add(args) -> int:
         return 1
 
     same_name_other_type = [
-        (i, l) for i, l in find_record_lines(name, zone)
-        if RECORD_LINE_PATTERN.match(l).group(1) != record_type
+        (i, existing_line) for i, existing_line in find_record_lines(lines, name, zone)
+        if RECORD_LINE_PATTERN.match(existing_line).group(1) != record_type
     ]
     if same_name_other_type:
-        existing_types = sorted({RECORD_LINE_PATTERN.match(l).group(1) for _, l in same_name_other_type})
+        existing_types = sorted({
+            RECORD_LINE_PATTERN.match(existing_line).group(1) for _, existing_line in same_name_other_type
+        })
         if record_type == "CNAME" or "CNAME" in existing_types:
             print(
                 f"\nWARNING: {fqdn_for(name, zone)} already has {'/'.join(existing_types)} record(s), "
@@ -1228,7 +1348,7 @@ def cmd_record_add(args) -> int:
             for _, existing_line in same_name_other_type:
                 print(f"  {existing_line.strip()}")
 
-    existing_same_type = find_record_lines(name, zone, record_type)
+    existing_same_type = find_record_lines(lines, name, zone, record_type)
     if existing_same_type:
         print(f"\nNote: {len(existing_same_type)} existing {record_type} record(s) already use this name:")
         for _, existing_line in existing_same_type:
@@ -1241,7 +1361,7 @@ def cmd_record_add(args) -> int:
         print("Aborted.")
         return 1
 
-    insert_record_line(line, zone)
+    insert_record_line(lines, line, zone)
     print(f"[ok] added to {DNSCONFIG_FILE.name}")
     offer_preview_and_submit(f"Add {record_type} for {fqdn_for(name, zone)}", interactive=interactive)
     return 0
@@ -1257,7 +1377,8 @@ def cmd_record_edit(args) -> int:
     interactive = not args.yes
 
     type_filter = args.type.upper() if args.type else None
-    matches = find_record_lines(name, zone, type_filter)
+    lines = read_dnsconfig_lines()
+    matches = find_record_lines(lines, name, zone, type_filter)
     if not matches:
         eprint(
             f"error: no records found for '{fqdn_for(name, zone)}'"
@@ -1300,33 +1421,32 @@ def cmd_record_edit(args) -> int:
         return 1
 
     record_type = parsed["type"]
-    if record_type not in ("A", "CNAME", "MX", "TXT"):
+    if record_type not in ("A", "CNAME", "MX", "TXT", "CAA"):
         eprint(
             f"error: editing {record_type} records isn't supported by this wizard - "
             "edit dnsconfig.js directly (see docs/record-types.md)."
         )
         return 1
 
+    # CAA's parsed "value" is currently "<tag> <value>" (parse_record_line_full
+    # doesn't split CAA's tag out into its own field - see build_record_line's
+    # CAA branch) - split it back apart here so editing offers the actual
+    # value as the default, not "issue letsencrypt.org" as one string.
+    current_tag = ""
+    current_value = parsed["value"]
+    if record_type == "CAA":
+        current_tag, _, current_value = parsed["value"].partition(" ")
+
     value = args.value
     if value is None:
         if not interactive:
             eprint("error: --yes requires --value to be provided (no prompts allowed).")
             return 1
-        label = {
-            "A": "IPv4 address",
-            "CNAME": "target hostname",
-            "MX": "mail server hostname",
-            "TXT": "text value",
-        }[record_type]
-        value = prompt(f"{label} for {fqdn_for(name, zone)}", default=parsed["value"])
+        label = RECORD_VALUE_LABELS[record_type]
+        value = prompt(f"{label} for {fqdn_for(name, zone)}", default=current_value)
 
-    if record_type in ("CNAME", "MX") and value and not value.endswith("."):
-        if interactive:
-            if prompt_yes_no(f"'{value}' has no trailing dot - add one?", default_yes=True):
-                value += "."
-        else:
-            value += "."
-            print(f"note: appended trailing dot -> {value}")
+    if record_type in ("CNAME", "MX"):
+        value = ensure_trailing_dot(value, interactive)
 
     priority = args.priority
     if record_type == "MX" and priority is None:
@@ -1351,12 +1471,23 @@ def cmd_record_edit(args) -> int:
         ttl_input = prompt("TTL override in seconds (blank = zone default)", default=str(ttl) if ttl else "")
         ttl = int(ttl_input) if ttl_input else None
 
+    tag = args.tag
+    if record_type == "CAA" and tag is None:
+        if interactive:
+            tag = prompt(f"CAA tag ({'/'.join(CAA_TAGS)})", default=current_tag or "issue")
+        else:
+            tag = current_tag or "issue"
+    if record_type == "CAA" and tag not in CAA_TAGS:
+        eprint(f"error: CAA tag must be one of {', '.join(CAA_TAGS)} - got '{tag}'.")
+        return 1
+
     had_explicit_proxy_off = parsed["proxied"] == "no"
     try:
         new_line = build_record_line(
             record_type, name, value, priority=priority, proxy=proxy, ttl=ttl,
             proxy_off=had_explicit_proxy_off and not proxy,
             extras=parsed.get("extras"), comment=parsed.get("comment", ""),
+            tag=tag if record_type == "CAA" else None,
         )
     except ValueError as e:
         eprint(f"error: {e}")
@@ -1373,7 +1504,7 @@ def cmd_record_edit(args) -> int:
         print("Aborted.")
         return 1
 
-    replace_line_at(idx, new_line)
+    replace_line_at(lines, idx, new_line)
     print(f"[ok] updated {DNSCONFIG_FILE.name}")
     offer_preview_and_submit(f"Edit {record_type} for {fqdn_for(name, zone)}", interactive=interactive)
     return 0
@@ -1389,7 +1520,8 @@ def cmd_record_remove(args) -> int:
     interactive = not args.yes
 
     record_type = args.type.upper() if args.type else None
-    matches = find_record_lines(name, zone, record_type)
+    lines = read_dnsconfig_lines()
+    matches = find_record_lines(lines, name, zone, record_type)
     if not matches:
         eprint(
             f"error: no records found for '{fqdn_for(name, zone)}'"
@@ -1432,7 +1564,7 @@ def cmd_record_remove(args) -> int:
         print("Aborted.")
         return 1
 
-    remove_line_at(idx)
+    remove_line_at(lines, idx)
     print(f"[ok] removed from {DNSCONFIG_FILE.name}")
     offer_preview_and_submit(f"Remove record for {fqdn_for(name, zone)}", interactive=interactive)
     return 0
@@ -1448,18 +1580,17 @@ def cmd_record_list(args) -> int:
             eprint(f"error: {e}")
             return 1
     elif args.zone:
-        if args.zone not in ZONES:
-            eprint(f"error: '{args.zone}' is not a zone this project manages ({', '.join(ZONES)}).")
+        if not resolve_zone_arg(args.zone, ZONES):
             return 1
         zone_filter = args.zone
 
-    lines = DNSCONFIG_FILE.read_text(encoding="utf-8").splitlines()
+    lines = read_dnsconfig_lines()
     zones_to_show = [zone_filter] if zone_filter else ZONES
 
     found = False
     for zone in zones_to_show:
         try:
-            start, end = find_zone_block(zone)
+            start, end = find_zone_block(lines, zone)
         except RuntimeError as e:
             eprint(f"error: {e}")
             continue
@@ -1482,15 +1613,14 @@ def cmd_record_list(args) -> int:
 
 
 def cmd_record_update_ip(args) -> int:
-    if args.zone and args.zone not in ZONES:
-        eprint(f"error: '{args.zone}' is not a zone this project manages ({', '.join(ZONES)}).")
+    if not resolve_zone_arg(args.zone, ZONES):
         return 1
     zones_to_check = [args.zone] if args.zone else ZONES
 
+    lines = read_dnsconfig_lines()
     matches = []  # (zone, idx, line, parsed)
     for zone in zones_to_check:
-        start, end = find_zone_block(zone)
-        lines = DNSCONFIG_FILE.read_text(encoding="utf-8").splitlines()
+        start, end = find_zone_block(lines, zone)
         for i in range(start + 1, end):
             parsed = parse_record_line_full(lines[i])
             if not parsed:
@@ -1521,7 +1651,10 @@ def cmd_record_update_ip(args) -> int:
             proxy_off=(parsed["proxied"] == "no" and not proxy),
             extras=parsed.get("extras"), comment=parsed.get("comment", ""),
         )
-        replace_line_at(idx, new_line)
+        # replace_line_at never shifts other indices (unlike insert/remove),
+        # so it's safe to mutate every match in memory first and write once.
+        lines[idx] = new_line
+    write_dnsconfig_lines(lines)
 
     print(f"[ok] updated {len(matches)} record(s) in {DNSCONFIG_FILE.name}")
     offer_preview_and_submit(
@@ -1531,14 +1664,14 @@ def cmd_record_update_ip(args) -> int:
 
 
 def cmd_record_prune_acme(args) -> int:
-    if args.zone and args.zone not in ZONES:
-        eprint(f"error: '{args.zone}' is not a zone this project manages ({', '.join(ZONES)}).")
+    if not resolve_zone_arg(args.zone, ZONES):
         return 1
     zones_to_check = [args.zone] if args.zone else ZONES
 
+    lines = read_dnsconfig_lines()
     entries = []  # (zone, idx, line, parsed)
     for zone in zones_to_check:
-        for i, line, parsed in local_acme_entries(zone):
+        for i, line, parsed in local_acme_entries(lines, zone):
             entries.append((zone, i, line, parsed))
 
     if not entries:
@@ -1551,7 +1684,7 @@ def cmd_record_prune_acme(args) -> int:
         pass
     else:
         env = load_cloudflare_env()
-        if "CLOUDFLARE_API_TOKEN" not in env and "CLOUDFLARE_API_TOKEN" not in os.environ:
+        if not has_cloudflare_token(env):
             eprint(
                 "note: no CLOUDFLARE_API_TOKEN available (.env, environment, or Key Vault) - "
                 "falling back to the token-count heuristic only. Set up .env (see "
@@ -1625,7 +1758,7 @@ def cmd_record_prune_acme(args) -> int:
         return 0
 
     interactive = not args.yes
-    indices = sorted(set(i for group in args.remove for i in group))
+    indices = sorted({i for group in args.remove for i in group})
     selected = []
     for i in indices:
         if i < 0 or i >= len(flat):
@@ -1641,7 +1774,8 @@ def cmd_record_prune_acme(args) -> int:
         return 1
 
     for _zone, idx, _line, _parsed in sorted(selected, key=lambda e: e[1], reverse=True):
-        remove_line_at(idx)
+        del lines[idx]
+    write_dnsconfig_lines(lines)
 
     print(f"[ok] removed {len(selected)} record(s) from {DNSCONFIG_FILE.name}")
     offer_preview_and_submit("Prune stale _acme-challenge TXT records", interactive=interactive)
@@ -1654,17 +1788,16 @@ def cmd_record_sync_acme(args, offer_submit: bool = True) -> int:
     out-of-band ACME client (e.g. Caddy) is the real source of truth for these
     specific records, unlike everything else dnsconfig.js manages."""
     env = load_cloudflare_env()
-    if "CLOUDFLARE_API_TOKEN" not in env and "CLOUDFLARE_API_TOKEN" not in os.environ:
-        eprint("error: CLOUDFLARE_API_TOKEN not set in .env, the environment, or Key Vault.")
+    if not require_cloudflare_token(env):
         return 1
 
-    if args.zone and args.zone not in ZONES:
-        eprint(f"error: '{args.zone}' is not a zone this project manages ({', '.join(ZONES)}).")
+    if not resolve_zone_arg(args.zone, ZONES):
         return 1
     zones_to_check = [args.zone] if args.zone else ZONES
 
     to_remove = []  # (zone, idx, line)
     to_add = []     # (zone, name, value, ttl)
+    diff_lines = read_dnsconfig_lines()
     for zone in zones_to_check:
         print(f"Fetching live state for {zone} ...", file=sys.stderr)
         live = fetch_live_acme_snapshot(zone, env)
@@ -1672,7 +1805,7 @@ def cmd_record_sync_acme(args, offer_submit: bool = True) -> int:
             eprint(f"error: failed to fetch live state for {zone} (dnscontrol get-zones failed).")
             return 1
 
-        local = local_acme_entries(zone)
+        local = local_acme_entries(diff_lines, zone)
         local_keys = {(p["name"], p["value"]) for _, _, p in local}
         live_keys = {(p["name"], p["value"]) for p in live}
 
@@ -1707,35 +1840,43 @@ def cmd_record_sync_acme(args, offer_submit: bool = True) -> int:
         # Re-resolve indices from the current file state right before editing
         # each zone - an earlier zone's edits in this same loop shift line
         # numbers for every zone below it, so the indices captured during the
-        # diff pass above can no longer be trusted here.
+        # diff pass above can no longer be trusted here. Mutate this zone's
+        # in-memory copy once and write it out a single time (rather than once
+        # per removal/insertion) to minimize how often dnsconfig.js is touched.
+        current_lines = read_dnsconfig_lines()
         stale_lines = {line for z, _i, line in to_remove if z == zone}
         if stale_lines:
             current_indices = [
-                i for i, line, _parsed in local_acme_entries(zone) if line in stale_lines
+                i for i, line, _parsed in local_acme_entries(current_lines, zone)
+                if line in stale_lines
             ]
             for i in sorted(current_indices, reverse=True):
-                remove_line_at(i)
-        for z, name, value, ttl in to_add:
-            if z != zone:
-                continue
-            new_line = build_record_line(
-                "TXT", name, value, ttl=int(ttl) if ttl else None
-            )
-            insert_record_line(new_line, zone)
+                del current_lines[i]
+        zone_additions = [(name, value, ttl) for z, name, value, ttl in to_add if z == zone]
+        if zone_additions:
+            _, end = find_zone_block(current_lines, zone)
+            for name, value, ttl in zone_additions:
+                new_line = build_record_line(
+                    "TXT", name, value, ttl=int(ttl) if ttl else None
+                )
+                current_lines.insert(end, new_line)
+                end += 1
+        if stale_lines or zone_additions:
+            write_dnsconfig_lines(current_lines)
 
     print(
         f"[ok] dnsconfig.js updated: removed {len(to_remove)}, added {len(to_add)} "
         "_acme-challenge record(s)"
     )
-    offer_preview_and_submit(
-        "Sync _acme-challenge TXT records with live Cloudflare state", interactive=interactive
-    )
+    if offer_submit:
+        offer_preview_and_submit(
+            "Sync _acme-challenge TXT records with live Cloudflare state", interactive=interactive
+        )
     return 0
 
 
 def cmd_lint(args) -> int:
-    if args.zone and args.zone not in ZONES:
-        eprint(f"error: '{args.zone}' is not a zone this project manages ({', '.join(ZONES)}).")
+    if not resolve_zone_arg(args.zone, ZONES):
         return 1
     zones_to_check = [args.zone] if args.zone else ZONES
 
@@ -1743,13 +1884,13 @@ def cmd_lint(args) -> int:
     seen_exact = set()
     name_types = collections.defaultdict(lambda: collections.defaultdict(list))
 
+    lines = read_dnsconfig_lines()
     for zone in zones_to_check:
         try:
-            start, end = find_zone_block(zone)
+            start, end = find_zone_block(lines, zone)
         except RuntimeError as e:
             issues.append(("error", str(e)))
             continue
-        lines = DNSCONFIG_FILE.read_text(encoding="utf-8").splitlines()
         for i in range(start + 1, end):
             parsed, skip_reason = classify_zone_line(lines[i])
             if skip_reason:
@@ -1766,24 +1907,60 @@ def cmd_lint(args) -> int:
                 issues.append(("error", f"{zone}: duplicate line (appears more than once): {raw}"))
             seen_exact.add(key)
             name_types[zone][parsed["name"]].append((parsed["type"], i, raw))
-            if parsed["type"] in ("CNAME", "MX") and parsed["value"] and not parsed["value"].endswith("."):
+            if parsed["type"] in HOSTNAME_VALUE_TYPES and parsed["value"] and not parsed["value"].endswith("."):
                 issues.append(("error", f"{zone}: {parsed['type']} target missing trailing dot: {raw}"))
+            if parsed["type"] == "A" and parsed["value"] and not is_valid_ipv4(parsed["value"]):
+                issues.append((
+                    "error",
+                    f"{zone}: A record value '{parsed['value']}' is not a valid IPv4 address: {raw}",
+                ))
+            if parsed["type"] == "CNAME" and parsed["name"] == "@":
+                issues.append((
+                    "error",
+                    (
+                        f"{zone}: CNAME at the zone apex ('@') is invalid per DNS spec, regardless "
+                        f"of whether another record shares the name - use A/ALIAS at the apex instead: {raw}"
+                    ),
+                ))
+            if parsed["ttl"]:
+                try:
+                    ttl_value = int(parsed["ttl"])
+                except ValueError:
+                    issues.append(("error", f"{zone}: TTL value '{parsed['ttl']}' is not an integer: {raw}"))
+                else:
+                    if ttl_value < TTL_MIN:
+                        issues.append((
+                            "error",
+                            f"{zone}: TTL value {ttl_value} is not positive (minimum {TTL_MIN}): {raw}",
+                        ))
+                    elif ttl_value > TTL_MAX:
+                        issues.append((
+                            "error",
+                            (
+                                f"{zone}: TTL value {ttl_value} exceeds the sanity limit of "
+                                f"{TTL_MAX} (1 week): {raw}"
+                            ),
+                        ))
 
     for zone, names in name_types.items():
-        for name, records in names.items():
-            types = {t for t, _, _ in records}
-            cname_entries = [r for r in records if r[0] == "CNAME"]
+        for name, entries in names.items():
+            types = {t for t, _, _ in entries}
+            cname_entries = [r for r in entries if r[0] == "CNAME"]
             if cname_entries and len(types) > 1:
                 issues.append((
                     "error",
-                    f"{zone}: {fqdn_for(name, zone)} has CNAME alongside other record type(s) "
-                    f"({', '.join(sorted(types))}) - CNAME can't coexist with anything else on the same name.",
+                    (
+                        f"{zone}: {fqdn_for(name, zone)} has CNAME alongside other record type(s) "
+                        f"({', '.join(sorted(types))}) - CNAME can't coexist with anything else on the same name."
+                    ),
                 ))
             if len(cname_entries) > 1:
                 issues.append((
                     "error",
-                    f"{zone}: {fqdn_for(name, zone)} has more than one CNAME record - "
-                    "only one CNAME is allowed per name.",
+                    (
+                        f"{zone}: {fqdn_for(name, zone)} has more than one CNAME record - "
+                        "only one CNAME is allowed per name."
+                    ),
                 ))
 
     if not issues:
@@ -1800,6 +1977,56 @@ def cmd_lint(args) -> int:
     return 1 if errors else 0
 
 
+def cmd_fmt(args) -> int:
+    """Re-sort each zone block in dnsconfig.js into canonical record-type
+    order (see dnsctl_lib.records.RECORD_TYPE_ORDER), preserving comments
+    attached to a record (TOOL-9). `--check` reports without writing, for
+    use as a pre-commit gate."""
+    if not resolve_zone_arg(args.zone, ZONES):
+        return 1
+    zones_to_fmt = [args.zone] if args.zone else ZONES
+
+    lines = read_dnsconfig_lines()
+    had_error = False
+    changed_zones = []
+
+    for zone in zones_to_fmt:
+        try:
+            start, end = find_zone_block(lines, zone)
+        except RuntimeError as e:
+            eprint(f"error: {e}")
+            had_error = True
+            continue
+        block = lines[start + 1 : end]
+        new_block, error = format_zone_block_lines(block)
+        if error:
+            eprint(f"error: {zone}: {error}")
+            had_error = True
+            continue
+        if new_block != block:
+            changed_zones.append(zone)
+            lines[start + 1 : end] = new_block
+
+    if had_error:
+        return 1
+
+    if args.check:
+        if changed_zones:
+            for zone in changed_zones:
+                print(f"[would reformat] {zone}: record order is not canonical.")
+            print("\nRun `python scripts/dnsctl.py fmt` to fix.")
+            return 1
+        print("[ok] dnsconfig.js is already sorted.")
+        return 0
+
+    if changed_zones:
+        write_dnsconfig_lines(lines)
+        print(f"[ok] reformatted: {', '.join(changed_zones)}")
+    else:
+        print("[ok] dnsconfig.js already sorted - nothing to do.")
+    return 0
+
+
 def collect_show_rows(zone_filter: str | None) -> tuple[list[list[str]], list[tuple[str, int, str]]]:
     """Return (rows, skipped) - `skipped` is (zone, 1-based line number, raw
     line) for anything classify_zone_line() couldn't parse as a record, so
@@ -1807,13 +2034,13 @@ def collect_show_rows(zone_filter: str | None) -> tuple[list[list[str]], list[tu
     zones_to_show = [zone_filter] if zone_filter else ZONES
     rows = []
     skipped = []
+    lines = read_dnsconfig_lines()
     for zone in zones_to_show:
         try:
-            start, end = find_zone_block(zone)
+            start, end = find_zone_block(lines, zone)
         except RuntimeError as e:
             eprint(f"error: {e}")
             continue
-        lines = DNSCONFIG_FILE.read_text(encoding="utf-8").splitlines()
         for i in range(start + 1, end):
             parsed, skip_reason = classify_zone_line(lines[i])
             if skip_reason:
@@ -1837,8 +2064,7 @@ def collect_show_rows(zone_filter: str | None) -> tuple[list[list[str]], list[tu
 def cmd_show(args) -> int:
     zone_filter = None
     if args.zone:
-        if args.zone not in ZONES:
-            eprint(f"error: '{args.zone}' is not a zone this project manages ({', '.join(ZONES)}).")
+        if not resolve_zone_arg(args.zone, ZONES):
             return 1
         zone_filter = args.zone
 
@@ -2048,7 +2274,7 @@ def build_parser() -> argparse.ArgumentParser:
              "Inferred automatically from a fully-qualified target.",
     )
     p_record_add.add_argument(
-        "--type", choices=["A", "CNAME", "MX", "TXT"], default=None,
+        "--type", choices=["A", "CNAME", "MX", "TXT", "CAA"], default=None,
         help="Record type. Prompted for if omitted.",
     )
     p_record_add.add_argument("--value", default=None, help="Target/value. Prompted for if omitted.")
@@ -2062,6 +2288,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable the Cloudflare proxy (A/CNAME only).",
     )
     p_record_add.add_argument("--ttl", type=int, default=None, help="TTL override in seconds.")
+    p_record_add.add_argument(
+        "--tag", choices=["issue", "issuewild", "iodef"], default=None,
+        help="CAA tag (CAA only). Prompted for if omitted.",
+    )
     p_record_add.add_argument(
         "--yes", action="store_true",
         help="Skip confirmation prompts and the preview/submit offer (needs --type and --value).",
@@ -2101,6 +2331,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable the Cloudflare proxy (A/CNAME only).",
     )
     p_record_edit.add_argument("--ttl", type=int, default=None, help="New TTL override in seconds.")
+    p_record_edit.add_argument(
+        "--tag", choices=["issue", "issuewild", "iodef"], default=None,
+        help="New CAA tag (CAA only). Prompted for if omitted.",
+    )
     p_record_edit.add_argument(
         "--yes", action="store_true",
         help="Skip confirmation prompts and the preview/submit offer (needs --value).",
@@ -2151,7 +2385,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Bulk-replace an IP across every A record that currently points at it, "
              "e.g. after a residential IP change.",
     )
-    p_record_update_ip.add_argument("old_ip", help="The current IP to find, e.g. 203.0.113.10.")
+    p_record_update_ip.add_argument("old_ip", help="The current IP to find, e.g. 203.0.113.5.")
     p_record_update_ip.add_argument("new_ip", help="The new IP to replace it with.")
     p_record_update_ip.add_argument(
         "--zone", choices=ZONES, default=None,
@@ -2217,6 +2451,22 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Restrict to one zone ({', '.join(ZONES)}). Default: all zones.",
     )
     p_lint.set_defaults(func=cmd_lint)
+
+    p_fmt = sub.add_parser(
+        "fmt",
+        help="Re-sort each zone block in dnsconfig.js into canonical record-type order "
+             "(A, CNAME, MX, TXT, CAA), preserving comments attached to a record.",
+    )
+    p_fmt.add_argument(
+        "--zone", choices=ZONES, default=None,
+        help=f"Restrict to one zone ({', '.join(ZONES)}). Default: all zones.",
+    )
+    p_fmt.add_argument(
+        "--check", action="store_true",
+        help="Don't modify the file - report (and exit non-zero) if reordering is needed, "
+             "for use as a pre-commit/CI gate.",
+    )
+    p_fmt.set_defaults(func=cmd_fmt)
 
     p_show = sub.add_parser(
         "show",

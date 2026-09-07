@@ -26,15 +26,23 @@ exist, not a control you can rely on. Two ways to get real enforcement:
    protection rules. Once real contractors are being paid to operate this, the cost of a paid GitHub
    plan is trivial next to the risk of an unreviewed DNS change reaching production. This is the
    recommended path.
-2. **Until/if that upgrade happens**, the only way to enforce "someone else reviewed this" the same
-   way this repo already enforces "this came from a merged PR" — in `apply.yml` itself, server-side,
-   so it can't be bypassed by a web UI merge or a local `--no-verify`. This isn't implemented yet;
-   it would mean extending `apply.yml`'s existing merged-PR check to also call the GitHub API for
-   the PR's reviews and refuse to apply (not refuse to *merge* — merging still can't be blocked
-   without paid branch protection) if there's no `APPROVED` review from someone other than the
-   author. Track this as a roadmap item before onboarding contractors if the Pro/Team upgrade isn't
-   happening immediately — a merge-without-review is currently only a process rule, not a technical
-   one.
+2. **Until/if that upgrade happens**, `apply.yml` already enforces "someone else reviewed this" the
+   same way it enforces "this came from a merged PR" — server-side, inside the workflow, so it can't
+   be bypassed by a web UI merge or a local `--no-verify`. It calls the GitHub API for the merged
+   PR's reviews and refuses to apply (not refuse to *merge* — merging still can't be blocked without
+   paid branch protection) unless there's an `APPROVED` review from someone other than the author.
+   **This check is off by default** — gated by `REQUIRE_NON_AUTHOR_REVIEW` in `apply.yml`'s
+   job-level `env:`, `"false"` out of the box because a solo-operator setup has exactly one
+   contributor and an always-on requirement would just permanently route every apply through the
+   `workflow_dispatch` escape hatch. **Set it to `"true"` before onboarding the first contractor or
+   anyone else who'll merge DNS changes** — until then, a merge-without-review is still only a
+   process rule, not a technical one. That check only runs *after* merge, though — a self-merged PR
+   fails `DNS Apply` rather than being blocked from merging at all, leaving `main` merged but not
+   applied until it's fixed. `dnsctl merge` can catch the same problem *before* merging: set
+   `DNSCTL_REQUIRE_NON_AUTHOR_REVIEW=true` in `.env` (see `.env.example`) and it refuses to merge a
+   PR with no non-author approval, same rule, cheaper failure. This is a local convenience only, not
+   the enforcement — `.env` never reaches CI, so `REQUIRE_NON_AUTHOR_REVIEW` in `apply.yml` must
+   still be `"true"` for this to actually be required rather than optional per-contributor.
 - Consider a **CODEOWNERS** entry on `dnsconfig.js` naming specific internal approvers once real
   branch protection is available — it auto-requests the right reviewer instead of leaving it to
   whoever notices the PR.
@@ -72,16 +80,25 @@ unsupervised:
   diff that will be applied to Cloudflare, not a summary of one.
 
 If you're onboarding contractors for real, also do the mundane but load-bearing things: unique
-GitHub accounts per contractor (never a shared login), 2FA required org-wide, and an offboarding
-checklist that revokes repo access immediately when a contractor's engagement ends — a stale
-credential is a bigger risk in practice than almost anything in this pipeline.
+GitHub accounts per contractor (never a shared login), 2FA required org-wide, an offboarding
+checklist that revokes repo access immediately when a contractor's engagement ends (a stale
+credential is a bigger risk in practice than almost anything in this pipeline), **and set
+`REQUIRE_NON_AUTHOR_REVIEW: "true"` in `apply.yml`** (see above) — without that flip, the "Approver
+reviews and merges" step below is still only a written process rule, not something `apply.yml`
+actually enforces. Also set **`REQUIRE_TICKET_REFERENCE: "true"` in `preview.yml`** at the same
+time, so every PR is required to trace back to the ticket that authorized it — without that flip,
+step 1's "requester opens a ticket" is likewise only a written process rule.
 
 ## The process
 
 ### 1. Requester opens a ticket
 
 State the record, the zone, the desired value, and why. For anything touching mail (MX, SPF, DKIM,
-DMARC) or the domain apex, say so explicitly — these need the extra care called out below.
+DMARC) or the domain apex, say so explicitly — these need the extra care called out below. Use the
+[DNS change request issue template](../../issues/new?template=dns_change_request.yml)
+(`.github/ISSUE_TEMPLATE/dns_change_request.yml`) if there's no existing external ticket (Jira,
+ServiceNow, etc.) to use instead — either way, the resulting ticket ID is what the contractor
+references on the PR in step 4.
 
 ### 2. Contractor starts the change
 
@@ -127,10 +144,18 @@ fix it before submitting, don't submit and hope review catches it.
 ### 4. Contractor submits
 
 ```sh
-python scripts/dnsctl.py submit "Add CNAME for myapp"
+python scripts/dnsctl.py submit "[INC0012345] Add CNAME for myapp"
 ```
 
 Opens the PR. From here the contractor's part is done except for responding to review feedback.
+
+**Include the ticket ID from step 1** (bracketed, e.g. `[INC0012345]` or `[JIRA-1234]`) in the PR
+title or body — required whenever `REQUIRE_TICKET_REFERENCE` is `"true"` in
+`.github/workflows/preview.yml` (see
+[making-changes.md#team-enterprise-mode-referencing-a-ticket](making-changes.md#teamenterprise-mode-referencing-a-ticket)).
+It's off by default for the same solo-operator reason `REQUIRE_NON_AUTHOR_REVIEW` is — **flip it on
+alongside `REQUIRE_NON_AUTHOR_REVIEW` before onboarding contractors**, so every merged change
+traces back to the ticket that authorized it.
 
 ### 5. Approver reviews and merges
 
@@ -185,6 +210,56 @@ situation where a wrong revert is most costly, so the diff still gets read befor
 See [dnsctl-cli.md#rollback](dnsctl-cli.md#rollback) for the full mechanics, and
 [operations.md](operations.md) for recovering from a bad change that reached Cloudflare via a route
 other than this pipeline (e.g. a manual `push`).
+
+## Concurrency at scale
+
+This process works fine with one contributor at a time. With many operators all editing the same
+`dnsconfig.js` — often from tickets, often at the same time — two things get much more common than
+they are for a solo maintainer, and the defenses below layer rather than any one of them being
+sufficient alone.
+
+**Primary mitigation: keep PRs small and single-purpose.** One ticket = one PR = ideally one
+record or a tightly related group (e.g. a CNAME plus its ACME challenge TXT). This is the cheapest
+lever available: the smaller and more localized a PR's diff, the less likely it overlaps another
+in-flight PR's lines at all, and the easier it is for an approver to actually understand what
+they're merging (also required by the review checklist above). Don't batch unrelated changes into
+one PR to save round-trips — that trades a small amount of contributor convenience for a much
+larger collision and review-quality cost once many people are editing concurrently.
+
+**Two distinct collision shapes, at scale:**
+
+1. **Two PRs touching *different* lines, but the second one to merge is now stale.** Both can pass
+   `DNS Preview` individually, yet the second PR's reviewed diff was computed against a `main` that
+   no longer matches what the first PR just merged. Left unhandled, merging the second PR could
+   silently re-apply or clobber something the first PR just changed.
+2. **Two PRs touching *overlapping* lines** — e.g. both adding a CNAME in the same
+   alphabetically-sorted block in `dnsconfig.js`. This is an ordinary git merge conflict; GitHub
+   simply won't offer a clean merge for the second PR until it's rebased, no repo-specific handling
+   needed or possible here.
+
+**Mechanical backstop for (1): GitHub Merge Queue.** Once the team is big enough to justify the
+plan cost, enable GitHub's native Merge Queue for `main` — see
+[branch-protection-and-secrets.md#github-enabling-merge-queue-for-main](branch-protection-and-secrets.md#github-enabling-merge-queue-for-main)
+for the setup steps and plan requirement (GitHub Team/Enterprise Cloud, or a public repo — not
+available on Free/Pro for a private repo, same tier restriction as real branch protection
+elsewhere in this doc). Merge queue serializes merges to `main`, re-running `DNS Preview` against
+each PR combined with the *latest* `main` immediately before it actually merges — so a PR that's
+gone stale relative to something that just landed is caught and rejected from the queue instead of
+being merged blind. It does not build or require any custom bot; it's a GitHub repo setting.
+
+**Safety net regardless of whether a merge queue is configured.** Even without a merge queue (e.g.
+the plan doesn't support it yet, or it's simply not turned on), `apply.yml`'s "Verify applied diff
+matches reviewed diff" step still catches problem (1) at apply time: right before `dnscontrol push`
+runs, it re-runs `preview` and fails loudly — without applying — if that output no longer matches
+the artifact captured when the merged PR's `DNS Preview` check ran. This is strictly a later,
+coarser catch than a merge queue (it fails after merge, not before, and the PR is already sitting
+in `main` when it fires), but it means a stale merge is never silently double-applied even with no
+merge queue in place at all.
+
+**Read together:** convention (small PRs) shrinks how often collisions happen in the first place;
+merge queue (once affordable) catches a staleness collision mechanically before it merges; the
+post-merge verify step catches the same class of problem after merge, regardless of the other two,
+as the last line of defense. None of these three replaces either of the others.
 
 ## Common mistakes to avoid
 

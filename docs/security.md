@@ -28,6 +28,22 @@ Separating read from write further limits exposure: the read-only token is the o
 
 If you ever suspect a real token was committed, treat it as compromised: revoke it in the Cloudflare dashboard immediately (a `git revert` or history rewrite does **not** undo the exposure — assume anyone who cloned the repo in that window has it), then issue a new one and update the corresponding GitHub secret.
 
+### Secret scanning is enforced in CI, not just via an opt-in local hook
+
+`.githooks/pre-commit` scans the staged diff for secret-shaped assignments before every commit —
+but hooks are opt-in per clone (`doctor` only *warns* when `core.hooksPath` isn't set) and
+`--no-verify` bypasses them outright. Nothing server-side inspects a push without something more.
+
+GitHub's own secret scanning / push protection needs **GitHub Advanced Security**, which (like the
+branch-protection APIs below) isn't available on a private repo on every plan — the same class of
+plan limitation, just a different feature. `.github/workflows/secret-scan.yml` runs
+[Gitleaks](https://github.com/gitleaks/gitleaks) (via the official `gitleaks/gitleaks-action`,
+pinned to a commit SHA like every other action in this repo) on every push and pull request,
+deliberately with **no `paths:` filter** — unlike every other workflow here, a secret can land in
+any file (a doc, a workflow YAML), not just `dnsconfig.js`/`scripts/**`. This runs regardless of
+local git config, so it's the thing actually enforcing "never commit secrets" once someone is
+pushing code without necessarily having run `dnsctl doctor`'s hook setup first.
+
 ## Fork safety in the preview workflow
 
 `preview.yml` uses the `pull_request` trigger, not `pull_request_target`. This matters because `pull_request_target` runs with the **base** repo's secrets even for PRs from forks — a classic way for a malicious fork PR to exfiltrate secrets via a modified workflow file. `pull_request` instead runs with the PR branch's own workflow file and no access to repo secrets when the PR comes from a fork. This repo has no external contributors today, but the setting costs nothing and removes an entire class of future risk.
@@ -60,12 +76,30 @@ GitHub's runners, so unlike a local git hook it cannot be bypassed with `--no-ve
 web-UI merge, or skipped by a clone that never opted into `core.hooksPath`. See
 [ci-cd-pipeline.md](ci-cd-pipeline.md) for the exact check and its one documented limitation.
 
+The second half of the same problem is "≥1 approving review from someone other than the author" —
+[DNS_Change_Process.md](DNS_Change_Process.md) documents this as the key control once more than one
+person has write access, but the same plan limitation above means GitHub may not enforce it either;
+without something more, anyone could merge their own unreviewed PR. `apply.yml` closes this the same
+way, as a second in-workflow check right after the merged-PR one: it calls the GitHub API for the
+merged PR's reviews and refuses to run `dnscontrol push` unless that PR's most recent review from
+some user other than the author is `APPROVED`. Like the merged-PR check, this can't be bypassed by a
+web-UI merge or a missing local hook — it runs on GitHub's runners regardless of how the PR got
+merged.
+
+**This check is gated by `REQUIRE_NON_AUTHOR_REVIEW` in `apply.yml`'s job-level `env:`, and it
+defaults to `"false"`.** A solo-operator setup has exactly one contributor — with the check
+unconditionally on, every apply from that one account would fail the review requirement and fall
+back to the `workflow_dispatch` escape hatch permanently, which isn't meaningfully safer than not
+having the check at all. The check itself is fully implemented either way; the toggle only decides
+whether it's enforced. **Before onboarding a second person who'll merge DNS changes, flip
+`REQUIRE_NON_AUTHOR_REVIEW` to `"true"`** — see "Onboarding and offboarding" below.
+
 `.githooks/pre-push` remains in place as a **local convenience** — it gives faster feedback (a
 `dnscontrol preview` before you even push) without waiting for CI — but it is not the thing actually
-preventing an unreviewed apply once the in-workflow check above is in place. Without that check
-(e.g. if you remove it), the pre-push hook is the only thing standing between a local `git push` and
-an unreviewed change, and it has real limits: it doesn't fire on a GitHub-web-UI merge, only on a
-local `git push`, and is bypassable with `--no-verify`.
+preventing an unreviewed apply once the in-workflow checks above are in place. Without those checks
+(e.g. if you remove them), the pre-push hook is the only thing standing between a local `git push`
+and an unreviewed change, and it has real limits: it doesn't fire on a GitHub-web-UI merge, only on
+a local `git push`, and is bypassable with `--no-verify`.
 
 If this repo is ever made public, or the account upgraded to GitHub Pro, switching to real
 server-side branch protection (requiring the `DNS Preview` check to pass before merge) would be a
@@ -115,8 +149,12 @@ production DNS unsupervised — see the access-boundary list in
 So most of onboarding/offboarding really is just repo + identity access, not a pile of DNS-specific
 secrets to separately track:
 
-- **Repo access** (GitHub team membership / collaborator list) — controls who can open PRs and,
-  where real branch protection is available, who can merge.
+- **Repo access** (GitHub team membership / collaborator list) — controls who can open PRs and
+  merge them. Once `REQUIRE_NON_AUTHOR_REVIEW` is set to `"true"` in `apply.yml` (do this **before**
+  granting write access to anyone besides the original operator), a merge without an approving
+  review from someone else still can't reach live Cloudflare: `apply.yml`'s in-workflow check
+  refuses to push in that case. Real GitHub branch protection, if it's available on this repo's
+  plan, would still be a strictly stronger additional layer — see above.
 - **Azure AD identity**, if Key Vault is in use — controls who can fetch the read-only Cloudflare
   token at all. Disabling this account on offboarding is the one non-GitHub step.
 - **GitHub Actions secrets** (`CLOUDFLARE_API_TOKEN_WRITE`, `CLOUDFLARE_API_TOKEN_READONLY`) are

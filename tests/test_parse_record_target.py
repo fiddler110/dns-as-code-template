@@ -28,7 +28,7 @@ def test_trailing_dot(mod):
 
 
 def test_case_insensitive(mod):
-    assert mod.parse_record_target("PLEX.Example.Com") == (
+    assert mod.parse_record_target("PLEX.Example.COM") == (
         "plex",
         "example.com",
     )

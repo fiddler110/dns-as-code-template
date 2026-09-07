@@ -58,6 +58,63 @@ def test_lint_flags_malformed_line_as_warning_not_silent_skip(mod, config_from, 
     assert "SRV_LIKE_BUT_UNSUPPORTED" in out
 
 
+def test_lint_flags_bad_ipv4(mod, config_from, capsys):
+    """TOOL-6: an A record whose value isn't a well-formed IPv4 address is
+    caught by lint instead of only surfacing at `preview` time."""
+    config_from("lint_bad_ipv4.js")
+    rc = run_lint(mod)
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "not a valid IPv4 address" in out
+
+
+def test_lint_flags_missing_trailing_dot_on_ns(mod, config_from, capsys):
+    """TOOL-6: the trailing-dot check now covers NS, not just CNAME/MX."""
+    config_from("lint_missing_dot_ns.js")
+    rc = run_lint(mod)
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "missing trailing dot" in out
+
+
+def test_lint_flags_missing_trailing_dot_on_srv(mod, config_from, capsys):
+    """TOOL-6: the trailing-dot check now covers SRV, not just CNAME/MX."""
+    config_from("lint_missing_dot_srv.js")
+    rc = run_lint(mod)
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "missing trailing dot" in out
+
+
+def test_lint_flags_apex_cname_unconditionally(mod, config_from, capsys):
+    """TOOL-6: an apex CNAME is invalid per DNS spec even with no sibling
+    record at the same name (unlike the coexistence check, which only fires
+    when something else already shares the name)."""
+    config_from("lint_apex_cname.js")
+    rc = run_lint(mod)
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "zone apex" in out
+
+
+def test_lint_flags_ttl_zero(mod, config_from, capsys):
+    """TOOL-6: TTL(0) is rejected - non-positive TTLs are meaningless."""
+    config_from("lint_ttl_zero.js")
+    rc = run_lint(mod)
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "not positive" in out
+
+
+def test_lint_flags_ttl_too_large(mod, config_from, capsys):
+    """TOOL-6: an absurdly large explicit TTL is rejected as a sanity check."""
+    config_from("lint_ttl_too_large.js")
+    rc = run_lint(mod)
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "exceeds the sanity limit" in out
+
+
 def test_lint_no_comma_record_is_included_not_dropped(mod, config_from, capsys):
     """TOOL-1 regression test: before the fix, FULL_RECORD_LINE_PATTERN
     required a trailing comma, so a valid record line without one (like

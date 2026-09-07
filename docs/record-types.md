@@ -76,8 +76,8 @@ domain.
   issuance entirely.
 - **`iodef`** — a `mailto:` (or `https:`) URL some CAs will notify if they receive a request for a
   certificate that violates this policy. Not universally honored, but harmless to set.
-- `dnsctl record add` does not support CAA (it only covers A/CNAME/MX/TXT) — add or edit these by
-  hand directly in `dnsconfig.js`.
+- `dnsctl record add`/`record edit` support CAA (`--type CAA --tag issue|issuewild|iodef --value ...`)
+  alongside A/CNAME/MX/TXT — e.g. `dnsctl record add example.com --type CAA --tag issue --value pki.goog`.
 
 ## SRV — service discovery records
 

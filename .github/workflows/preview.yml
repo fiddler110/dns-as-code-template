@@ -23,20 +23,55 @@ permissions:
 jobs:
   preview:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     # Read-only token only - this job must never see the write token, and
     # pull_request (not pull_request_target) keeps forked PRs from reaching
     # repo secrets at all.
     env:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN_READONLY }}
+      # Operating mode. "true" (enterprise/team mode) requires the PR title
+      # or body to reference a ticket ID (see
+      # .github/ISSUE_TEMPLATE/dns_change_request.yml and
+      # docs/DNS_Change_Process.md) before the rest of this check runs - turn
+      # this on once changes are executed by operators who didn't originate
+      # the request, so every record change traces back to a ticket. "false"
+      # (solo-operator mode, the default here) skips that check: with one
+      # contributor there's no ticket to lose the trail of. The check itself
+      # stays fully implemented either way - this only decides whether it's
+      # enforced.
+      REQUIRE_TICKET_REFERENCE: "false"
+      # Configurable so a team can match whatever ticketing system's ID
+      # format they actually use. Default matches both a ServiceNow-style ID
+      # with no separator ("[INC0012345]") and a Jira-style hyphenated
+      # project/prefix code ("[JIRA-1234]") - the hyphen is optional.
+      TICKET_REFERENCE_PATTERN: '\[[A-Z][A-Z0-9]*-?[0-9]+\]'
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - name: Install dnscontrol
+      # With multiple operators executing tickets they didn't originate, a PR
+      # with no link back to its ticket is both an audit gap and a support
+      # burden six months later. Runs first, before anything that talks to
+      # Cloudflare, so a missing ticket reference fails fast and cheaply.
+      - name: Require a ticket reference on this PR
+        if: env.REQUIRE_TICKET_REFERENCE == 'true'
         env:
-          DNSCONTROL_VERSION: "4.46.0"
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
         run: |
           set -euo pipefail
+          if [[ "$PR_TITLE" =~ $TICKET_REFERENCE_PATTERN || "$PR_BODY" =~ $TICKET_REFERENCE_PATTERN ]]; then
+            echo "Ticket reference found."
+          else
+            echo "::error::No ticket reference matching pattern '${TICKET_REFERENCE_PATTERN}' found in the PR title or body. Open a DNS change request issue (.github/ISSUE_TEMPLATE/dns_change_request.yml) if you don't have a ticket yet, then reference its ID in the PR title or body, e.g. \"[INC0012345] Add CNAME for myapp\"."
+            exit 1
+          fi
+
+      - name: Install dnscontrol
+        run: |
+          set -euo pipefail
+          # Single source of truth for the pinned version - see .dnscontrol-version.
+          DNSCONTROL_VERSION="$(cat .dnscontrol-version)"
           base="https://github.com/DNSControl/dnscontrol/releases/download/v${DNSCONTROL_VERSION}"
           asset="dnscontrol_${DNSCONTROL_VERSION}_linux_amd64.tar.gz"
           curl -sSLo "$asset" "${base}/${asset}"
@@ -52,9 +87,20 @@ jobs:
           set -o pipefail
           dnscontrol preview 2>&1 | tee preview_output.txt
 
+      # Lets apply.yml confirm, right before push, that live state hasn't
+      # drifted since this reviewed diff - it re-runs preview and diffs the
+      # output against this artifact.
+      - name: Upload preview output as artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: preview-output-${{ github.event.pull_request.head.sha }}
+          path: preview_output.txt
+          retention-days: 14
+
       - name: Comment preview result on PR
         if: always()
-        uses: actions/github-script@v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
         with:
           script: |
             const fs = require('fs');

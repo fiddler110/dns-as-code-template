@@ -97,6 +97,34 @@ pytest tests/ -v
 
 Tests live in `tests/`, use fixture `.js` files under `tests/fixtures/`, and never touch the real `dnsconfig.js` or the network — each one points the module at a temporary copy of a fixture. The `test.yml` workflow runs this suite automatically whenever `scripts/**` or `tests/**` changes, independent of whether `dnsconfig.js` changed.
 
+## Team/enterprise mode: referencing a ticket
+
+On a solo-operator setup, a PR's intent is self-evident and no ticket reference is required. Once
+more than one operator is executing changes from tickets they didn't originate (see
+[DNS_Change_Process.md](DNS_Change_Process.md)), open a [DNS change request
+issue](../../issues/new?template=dns_change_request.yml) first — or use an existing external
+ticket (ServiceNow, Jira, etc.) — then reference its ID in the PR title or body in the format
+`[<PREFIX>-<NUMBER>]`, e.g. `[INC0012345] Add CNAME for myapp` or `[JIRA-1234] Add CNAME for
+myapp`. `submit`'s `--message`/`--body` arguments are a convenient place to put it:
+
+```sh
+python scripts/dnsctl.py submit "[INC0012345] Add CNAME for myapp"
+```
+
+This is enforced in CI by the `DNS Preview` workflow's "Require a ticket reference on this PR"
+step, gated by `REQUIRE_TICKET_REFERENCE` in `.github/workflows/preview.yml` — `"false"` (off) by
+default for solo-operator mode, flip to `"true"` once a team is submitting tickets on each other's
+behalf. The exact pattern it matches against is configurable via `TICKET_REFERENCE_PATTERN` in the
+same file, in case your ticketing system's ID format differs from the default.
+
+**Optional local mirror.** Set `DNSCTL_REQUIRE_TICKET_REFERENCE=true` in `.env` and `dnsctl submit`
+checks the same pattern locally, before doing anything (no branch, commit, push, or PR), so a
+contractor gets the error immediately instead of waiting for the DNS Preview check on GitHub.
+`DNSCTL_TICKET_REFERENCE_PATTERN` overrides the pattern the same way `TICKET_REFERENCE_PATTERN`
+does — keep the two in sync. This is a convenience only, not the enforcement: nothing about `.env`
+stops a contractor from leaving it unset, so a team must still flip `REQUIRE_TICKET_REFERENCE` in
+`preview.yml` for this to actually be required. See `.env.example` for both variables.
+
 ## Common mistakes to avoid
 
 - **Forgetting the trailing dot** on CNAME/MX targets (`example.com` vs `example.com.`). dnscontrol will usually catch this as a config error at `preview` time, but always double check.

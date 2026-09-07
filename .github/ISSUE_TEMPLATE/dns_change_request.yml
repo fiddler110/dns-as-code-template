@@ -1,0 +1,77 @@
+name: DNS change request
+description: Request a DNS record change (add/edit/remove) on one of the managed zones. See docs/DNS_Change_Process.md.
+title: "[DNS] "
+labels:
+  - dns-change
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This issue is the "ticket" referenced in `docs/DNS_Change_Process.md`. Once filed, its
+        ticket ID (or an external ticketing system's ID, e.g. `INC0012345`/`JIRA-1234`) belongs in
+        the PR title/body that implements it — see `docs/making-changes.md` for the required
+        format.
+  - type: input
+    id: ticket_id
+    attributes:
+      label: Ticket ID
+      description: >-
+        The ID this change will be tracked under (e.g. INC0012345, JIRA-1234, or this issue's own
+        number once filed). This is what gets referenced on the implementing PR.
+      placeholder: INC0012345
+    validations:
+      required: true
+  - type: dropdown
+    id: zone
+    attributes:
+      label: Zone
+      description: >-
+        Which zone does this change apply to? Replace these placeholder options with your
+        project's actual managed zones - see ZONES in scripts/dnsctl.py.
+      options:
+        - example.com
+        - example.org
+    validations:
+      required: true
+  - type: dropdown
+    id: record_type
+    attributes:
+      label: Record type
+      options:
+        - A
+        - CNAME
+        - MX
+        - TXT
+        - Other (describe in justification)
+    validations:
+      required: true
+  - type: input
+    id: record_name
+    attributes:
+      label: Record name
+      description: The record's (sub)domain, relative to the zone (e.g. "myapp" for myapp.example.com).
+      placeholder: myapp
+    validations:
+      required: true
+  - type: input
+    id: record_target
+    attributes:
+      label: Target / value
+      description: The value the record should point to (IP, hostname, TXT content, etc.).
+      placeholder: origin.example.com.
+    validations:
+      required: false
+  - type: textarea
+    id: justification
+    attributes:
+      label: Justification
+      description: Why is this change needed? Note explicitly if it touches mail (MX/SPF/DKIM/DMARC) or the domain apex.
+    validations:
+      required: true
+  - type: input
+    id: requested_by
+    attributes:
+      label: Requested by
+      description: Name or team requesting this change, if different from whoever files this issue.
+    validations:
+      required: false

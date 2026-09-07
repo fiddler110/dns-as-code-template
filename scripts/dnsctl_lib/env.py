@@ -45,11 +45,18 @@ def fetch_keyvault_secret(vault: str, secret_name: str) -> str | None:
             "https://learn.microsoft.com/cli/azure/install-azure-cli"
         )
         return None
-    result = subprocess.run(
-        [az, "keyvault", "secret", "show", "--vault-name", vault,
-         "--name", secret_name, "--query", "value", "-o", "tsv"],
-        capture_output=True, text=True,
-    )
+    try:
+        result = subprocess.run(
+            [az, "keyvault", "secret", "show", "--vault-name", vault,
+             "--name", secret_name, "--query", "value", "-o", "tsv"],
+            capture_output=True, text=True, check=False, timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        eprint(
+            f"warning: 'az keyvault secret show' timed out after 60s fetching "
+            f"'{secret_name}' from Key Vault '{vault}'."
+        )
+        return None
     if result.returncode != 0:
         stderr = result.stderr.strip()
         eprint(
@@ -94,3 +101,24 @@ def load_cloudflare_env(env_file: Path) -> dict:
     if token:
         env["CLOUDFLARE_API_TOKEN"] = token
     return env
+
+
+def has_cloudflare_token(env: dict) -> bool:
+    """Whether a CLOUDFLARE_API_TOKEN is available, from either the loaded
+    `env` dict (.env/Key Vault) or the process environment."""
+    return "CLOUDFLARE_API_TOKEN" in env or "CLOUDFLARE_API_TOKEN" in os.environ
+
+
+def require_cloudflare_token(env: dict, hint: str | None = None) -> bool:
+    """Guard shared by every command that hard-requires a Cloudflare token
+    before doing anything: prints the standard "not set" error (plus an
+    optional extra `hint` line, since some call sites append one) and returns
+    False when missing. Callers that only want the plain bool for a softer
+    fallback (e.g. `begin`, `record prune-acme`) should call
+    has_cloudflare_token directly instead."""
+    if has_cloudflare_token(env):
+        return True
+    eprint("error: CLOUDFLARE_API_TOKEN not set in .env, the environment, or Key Vault.")
+    if hint:
+        eprint(hint)
+    return False

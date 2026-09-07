@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Local safety net for two things that should never reach a commit:
+# Local safety net for things that should never reach a commit:
 #   1. a real secret pasted anywhere in the staged diff
 #   2. a malformed dnsconfig.js record that `dnsctl lint` would catch
+#   3. a dnsconfig.js zone block that isn't in canonical record-type order
+#      (`dnsctl fmt` would reorder it)
 #
 # Enabled the same way as .githooks/pre-push (same core.hooksPath):
 #   git config core.hooksPath .githooks
@@ -60,6 +62,16 @@ if echo "$staged_files" | grep -qx "dnsconfig.js"; then
     echo "pre-commit: dnsconfig.js changed - running 'dnsctl lint'..."
     if ! "$python_bin" scripts/dnsctl.py lint; then
       echo "pre-commit: dnsctl lint failed - fix the issues above before committing." >&2
+      fail=1
+    fi
+
+    # --- 4. Verify dnsconfig.js is canonically sorted ----------------------
+    # --check only reports; it never rewrites a staged file out from under
+    # the developer - if it's not sorted, they run `dnsctl fmt` themselves
+    # and re-stage.
+    echo "pre-commit: checking dnsconfig.js is canonically sorted ('dnsctl fmt --check')..."
+    if ! "$python_bin" scripts/dnsctl.py fmt --check; then
+      echo "pre-commit: dnsconfig.js is not canonically sorted - run 'python scripts/dnsctl.py fmt' and re-stage." >&2
       fail=1
     fi
   fi

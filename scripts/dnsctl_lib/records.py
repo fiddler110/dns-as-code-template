@@ -25,14 +25,39 @@ FULL_RECORD_LINE_PATTERN = re.compile(
     r'^\s*(' + "|".join(KNOWN_RECORD_TYPES) + r')\((.*)\),?\s*(//.*)?$'
 )
 # For these record types, only this many positional args (after name) are
-# meaningful (MX: priority + value, everything else: value). Anything beyond
-# that - an unrecognized modifier call, say - is preserved verbatim in
-# `extras` instead of being silently absorbed into the record's value.
-EXPECTED_POSITIONAL_COUNT = {"A": 1, "CNAME": 1, "TXT": 1, "MX": 2}
+# meaningful (MX: priority + value, CAA: tag + value, everything else:
+# value). Anything beyond that - an unrecognized modifier call, say - is
+# preserved verbatim in `extras` instead of being silently absorbed into the
+# record's value.
+EXPECTED_POSITIONAL_COUNT = {"A": 1, "CNAME": 1, "TXT": 1, "MX": 2, "CAA": 2}
 # Non-record lines that are expected inside a D(...) block besides records
 # themselves - anything else gets flagged by classify_zone_line() below
 # instead of being silently skipped.
 DIRECTIVE_LINE_PATTERN = re.compile(r'^\s*(DnsProvider|DefaultTTL)\(')
+
+# Record types whose value is a hostname dnscontrol expects fully-qualified
+# (trailing dot) rather than relative - used by `dnsctl lint`. Deliberately
+# excludes CAA: its "issue"/"issuewild" value is a CA domain name written
+# without a trailing dot (e.g. CAA("@", "issue", "letsencrypt.org")), and
+# "iodef" is a mailto:/https: URL, not a hostname at all.
+HOSTNAME_VALUE_TYPES = frozenset({"CNAME", "MX", "NS", "SRV", "ALIAS", "PTR"})
+
+# Sanity bounds for an explicit TTL(n) value, used by `dnsctl lint`. TTL_MIN
+# excludes 0 (meaningless/invalid) but allows the Cloudflare-specific TTL(1)
+# = "automatic" shorthand documented in docs/record-types.md. TTL_MAX is a
+# generous upper bound (1 week) - well above any real use here, just catches
+# a stray extra digit or two before it reaches `preview`.
+TTL_MIN = 1
+TTL_MAX = 604800
+
+_IPV4_SHAPE_PATTERN = re.compile(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')
+
+
+def is_valid_ipv4(value: str) -> bool:
+    """True if `value` is exactly 4 dot-separated octets, each 0-255."""
+    if not _IPV4_SHAPE_PATTERN.match(value):
+        return False
+    return all(0 <= int(octet) <= 255 for octet in value.split("."))
 
 
 def detect_zone(spec: str, zones: list[str]) -> str | None:
@@ -180,7 +205,7 @@ def parse_record_line_full(line: str) -> dict | None:
         else:
             # An unsupported modifier or extra argument this parser doesn't
             # model - keep the raw token so a rewrite can preserve it
-            # instead of mashing it into the value (see ROADMAP.md TOOL-2).
+            # instead of mashing it into the value.
             extras.append(a)
 
     name = unquote(raw_args[0])
@@ -210,10 +235,10 @@ def classify_zone_line(line: str) -> tuple[dict | None, str | None]:
     parse_record_line_full() for a record line, `skip_reason` is a
     human-readable string for anything that isn't a record and isn't one of
     the expected non-record directives - callers should surface this rather
-    than silently skip it (that silent skip was the TOOL-1 bug: `show`/`lint`
-    used to disagree with `record list` about how many records exist).
-    Both are None for a blank line, a `//` comment, or a recognised directive
-    (DnsProvider/DefaultTTL) - there's nothing to report for those.
+    than silently skip it (`show`/`lint` disagreeing about how many records
+    exist is exactly the kind of bug a silent skip causes). Both are None for
+    a blank line, a `//` comment, or a recognised directive (DnsProvider/
+    DefaultTTL) - there's nothing to report for those.
     """
     raw = line.strip()
     if not raw or raw.startswith("//") or DIRECTIVE_LINE_PATTERN.match(raw):
@@ -233,7 +258,7 @@ def find_zone_block_in_lines(lines: list[str], zone: str, source_name: str = "th
     start = None
     for i, line in enumerate(lines):
         stripped = line.strip()
-        if stripped.startswith(f'D("{zone}"') or stripped.startswith(f"D('{zone}'"):
+        if stripped.startswith((f'D("{zone}"', f"D('{zone}'")):
             start = i
             break
     if start is None:
@@ -242,6 +267,11 @@ def find_zone_block_in_lines(lines: list[str], zone: str, source_name: str = "th
         if lines[j].strip() == ");":
             return start, j
     raise RuntimeError(f'Could not find the closing ");" for zone {zone} in {source_name}.')
+
+
+# Valid CAA property tags (dnscontrol/RFC 6844) - the record wizard only
+# supports these three, matching what's actually used in dnsconfig.js.
+CAA_TAGS = ("issue", "issuewild", "iodef")
 
 
 def build_record_line(
@@ -254,6 +284,7 @@ def build_record_line(
     proxy_off: bool = False,
     extras: list[str] | None = None,
     comment: str = "",
+    tag: str | None = None,
 ) -> str:
     quoted_name = json.dumps(name)
     quoted_value = json.dumps(value)
@@ -272,7 +303,7 @@ def build_record_line(
             parts.append("CF_PROXY_ON")
         elif proxy_off:
             # Preserve an explicit CF_PROXY_OFF that was already on the line
-            # rather than silently normalising it away (see ROADMAP.md TOOL-2).
+            # rather than silently normalising it away.
             parts.append("CF_PROXY_OFF")
         if ttl:
             parts.append(f"TTL({ttl})")
@@ -289,7 +320,107 @@ def build_record_line(
             parts.append(f"TTL({ttl})")
         return finish(parts)
 
+    if record_type == "CAA":
+        if not tag:
+            raise ValueError("CAA records require a tag (issue, issuewild, or iodef).")
+        if tag not in CAA_TAGS:
+            raise ValueError(
+                f"CAA tag must be one of {', '.join(CAA_TAGS)} - got '{tag}'."
+            )
+        parts = [quoted_name, json.dumps(tag), quoted_value]
+        if ttl:
+            parts.append(f"TTL({ttl})")
+        return finish(parts)
+
     raise ValueError(
         f"The record wizard doesn't support {record_type} records yet - "
         "edit dnsconfig.js directly for this type. See docs/record-types.md."
     )
+
+
+# Canonical per-zone record-type order for `dnsctl fmt` - matches how the
+# zone blocks in dnsconfig.js are hand-kept by convention (A, then CNAME,
+# then MX, then TXT, then CAA).
+RECORD_TYPE_ORDER = ["A", "CNAME", "MX", "TXT", "CAA"]
+
+
+def _record_type_rank(record_type: str) -> tuple[int, str | int]:
+    """Sort key for RECORD_TYPE_ORDER: known types sort first in that exact
+    order; anything else (NS/SRV/ALIAS/PTR/AAAA/...) sorts after them,
+    grouped alphabetically by type, rather than being silently misplaced."""
+    if record_type in RECORD_TYPE_ORDER:
+        return (0, RECORD_TYPE_ORDER.index(record_type))
+    return (1, record_type)
+
+
+def format_zone_block_lines(lines: list[str]) -> tuple[list[str], str | None]:
+    """Re-sort one zone block's lines (everything strictly between the
+    `D("zone", ...)` line and its closing `);` - neither of those two lines
+    is passed in) into canonical record-type order (RECORD_TYPE_ORDER),
+    stable within a type so a hand-picked ordering within a type (e.g. an
+    alphabetical CNAME list) survives unchanged.
+
+    A standalone `//` comment line directly above a record travels with
+    that record. A trailing `// ...` comment already lives on the record's
+    own line (see parse_record_line_full's `comment` field) and needs no
+    special handling here - it's just part of the line string.
+
+    Leading `DnsProvider(...)`/`DefaultTTL(...)` directive lines are kept in
+    place at the top, before any record.
+
+    Returns (new_lines, error). On success `error` is None and `new_lines`
+    is the reordered block. If the block contains anything fmt can't safely
+    reorder without risking a semantic change (a directive appearing after
+    the first record, a blank line among records, or a line that isn't a
+    parseable known record type), `error` is a human-readable reason and
+    `new_lines` is `lines` unchanged - fmt would rather refuse than guess
+    wrong.
+    """
+    header: list[str] = []
+    units: list[dict] = []
+    pending_comments: list[str] = []
+    seen_record = False
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            if seen_record or units:
+                return lines, (
+                    "blank line found among/after records - fmt doesn't know where "
+                    "it belongs; remove it or reorder this block by hand"
+                )
+            header.append(line)
+            continue
+        if stripped.startswith("//"):
+            pending_comments.append(line)
+            continue
+        if DIRECTIVE_LINE_PATTERN.match(stripped):
+            if seen_record:
+                return lines, (
+                    f"directive line found after the first record ({stripped.strip()}) - "
+                    "fmt only supports DnsProvider(...)/DefaultTTL(...) at the top of the block"
+                )
+            header.extend(pending_comments)
+            pending_comments = []
+            header.append(line)
+            continue
+        parsed = parse_record_line_full(line)
+        if parsed is None:
+            return lines, (
+                f"line could not be parsed as a known record type - fmt refuses to "
+                f"reorder a block it can't fully understand: {stripped}"
+            )
+        seen_record = True
+        units.append({"leading": pending_comments, "line": line, "type": parsed["type"]})
+        pending_comments = []
+
+    trailing_comments = pending_comments  # comment(s) after the last record, if any
+
+    ordered_units = sorted(units, key=lambda u: _record_type_rank(u["type"]))
+
+    new_lines = list(header)
+    for unit in ordered_units:
+        new_lines.extend(unit["leading"])
+        new_lines.append(unit["line"])
+    new_lines.extend(trailing_comments)
+    return new_lines, None

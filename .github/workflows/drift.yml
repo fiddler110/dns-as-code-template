@@ -20,18 +20,19 @@ permissions:
 jobs:
   drift:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     # Read-only token only - this job never applies anything, only detects.
     env:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN_READONLY }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Install dnscontrol
-        env:
-          DNSCONTROL_VERSION: "4.46.0"
         run: |
           set -euo pipefail
+          # Single source of truth for the pinned version - see .dnscontrol-version.
+          DNSCONTROL_VERSION="$(cat .dnscontrol-version)"
           base="https://github.com/DNSControl/dnscontrol/releases/download/v${DNSCONTROL_VERSION}"
           asset="dnscontrol_${DNSCONTROL_VERSION}_linux_amd64.tar.gz"
           curl -sSLo "$asset" "${base}/${asset}"
@@ -49,7 +50,7 @@ jobs:
 
       - name: File or update drift issue
         if: failure()
-        uses: actions/github-script@v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
         with:
           script: |
             const fs = require('fs');

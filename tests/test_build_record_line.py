@@ -1,9 +1,9 @@
 """Round-trip tests for build_record_line() against parse_record_line_full().
 
-The TOOL-2 cases below assert the fixed round-trip behavior: CF_PROXY_OFF,
-a trailing `//` comment, and an unrecognized modifier token are all now
-preserved through parse -> build -> parse instead of being dropped or
-mashed into the record's value. See ROADMAP.md TOOL-2.
+The cases below assert the round-trip behavior: CF_PROXY_OFF, a trailing
+`//` comment, and an unrecognized modifier token are all preserved through
+parse -> build -> parse instead of being dropped or mashed into the
+record's value.
 """
 
 
@@ -40,6 +40,40 @@ def test_txt_round_trip_with_ttl(mod):
     assert parsed["type"] == "TXT"
     assert parsed["value"] == "token"
     assert parsed["ttl"] == "120"
+
+
+def test_caa_issue(mod):
+    """TOOL-7: build_record_line supports CAA with the "issue" tag, matching
+    dnsconfig.js's existing CAA("@", "issue", "letsencrypt.org") shape."""
+    line = mod.build_record_line("CAA", "@", "letsencrypt.org", tag="issue")
+    assert line.strip() == 'CAA("@", "issue", "letsencrypt.org"),'
+    parsed = mod.parse_record_line_full(line)
+    assert parsed["type"] == "CAA"
+    assert parsed["name"] == "@"
+
+
+def test_caa_issuewild(mod):
+    line = mod.build_record_line("CAA", "@", "pki.goog", tag="issuewild")
+    assert line.strip() == 'CAA("@", "issuewild", "pki.goog"),'
+
+
+def test_caa_iodef(mod):
+    line = mod.build_record_line("CAA", "@", "mailto:you@example.com", tag="iodef")
+    assert line.strip() == 'CAA("@", "iodef", "mailto:you@example.com"),'
+
+
+def test_caa_requires_tag(mod):
+    import pytest
+
+    with pytest.raises(ValueError, match="require a tag"):
+        mod.build_record_line("CAA", "@", "letsencrypt.org")
+
+
+def test_caa_rejects_unknown_tag(mod):
+    import pytest
+
+    with pytest.raises(ValueError, match="must be one of"):
+        mod.build_record_line("CAA", "@", "letsencrypt.org", tag="bogus")
 
 
 def test_tool2_cf_proxy_off_is_round_tripped(mod):

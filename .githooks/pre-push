@@ -15,7 +15,7 @@ zero="0000000000000000000000000000000000000000"
 # Keep this file list identical to the `paths:` filters in
 # .github/workflows/preview.yml and .github/workflows/apply.yml — if they
 # drift, this local check and CI stop agreeing about what's DNS-relevant.
-dns_relevant_paths=(dnsconfig.js creds.json)
+dns_relevant_paths=(dnsconfig.js creds.json .github/workflows/apply.yml)
 
 while read -r local_ref local_sha remote_ref remote_sha; do
   if [ "$remote_ref" = "$protected_ref" ]; then

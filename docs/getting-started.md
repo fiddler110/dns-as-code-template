@@ -100,14 +100,18 @@ your-repo/
 ├── creds.json                 # tells dnscontrol which env var holds the Cloudflare token (no secrets)
 ├── .env                       # your local read-only token (gitignored, never committed)
 ├── .env.example                # documents what .env should contain
-├── .githooks/pre-commit         # local secret scan + dnsctl lint at commit time
+├── .dnscontrol-version          # single source of truth for the pinned dnscontrol version
+├── .githooks/pre-commit         # local secret scan + dnsctl lint/fmt --check at commit time
 ├── .githooks/pre-push          # local safety check before pushing to main
 ├── .github/workflows/
 │   ├── preview.yml             # runs on every PR
 │   ├── apply.yml                # runs on merge to main
-│   ├── test.yml                  # lint + pytest suite on every push/PR touching the tooling
+│   ├── test.yml                  # lint + ruff + pytest suite on every push/PR touching the tooling
 │   ├── drift.yml                 # scheduled check that live Cloudflare still matches dnsconfig.js
-│   └── dnscontrol-version-check.yml  # scheduled check for a newer dnscontrol release
+│   ├── reachability.yml          # post-apply check that proxied hostnames are actually reachable
+│   ├── secret-scan.yml           # gitleaks on every push and PR, no paths filter
+│   └── dnscontrol-version-check.yml  # scheduled check for a newer dnscontrol release + token expiry
+├── .github/ISSUE_TEMPLATE/dns_change_request.yml  # the "ticket" template for team/enterprise mode
 ├── scripts/dnsctl.py            # cross-platform helper script (see docs/dnsctl-cli.md)
 ├── tests/                        # pytest suite for scripts/dnsctl.py
 └── docs/                        # you are here

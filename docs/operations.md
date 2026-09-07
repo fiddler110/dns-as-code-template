@@ -72,6 +72,18 @@ Close the tracking issue once the drift is resolved either way — the workflow 
 
 **Known limitation:** GitHub disables scheduled workflows on a repository with no push activity for 60 days. For a low-traffic config repo, drift detection can silently stop running if nothing else has been pushed in a while — a manual `workflow_dispatch` run periodically (or any other commit to the repo) resets that clock.
 
+## Responding to a reachability failure
+
+`.github/workflows/reachability.yml` runs after every successful `DNS Apply` run and `curl`s each proxied hostname over HTTPS. It only reports a *connection-level* failure — DNS resolution failure, TLS handshake failure, connection refused/timeout — not an HTTP error status, since a 4xx/5xx still proves the request reached something behind Cloudflare's edge. If it finds one, it files or updates a single persistent GitHub issue titled "DNS reachability check failed" (same dedup-by-marker pattern as drift/apply issues), listing which hostname(s) failed and why.
+
+When that issue appears:
+
+- **Confirm it's real** — try the hostname yourself (`curl -v https://<host>/` or a browser). Transient network blips on the runner are possible but should be rare given the built-in retries.
+- **Wrong DNS target** — check the corresponding record in `dnsconfig.js` actually points at the right place (e.g. a `CNAME` to a tunnel/load-balancer target that no longer exists, or to the wrong backend). Fix it through a PR like any other change.
+- **Backend/origin down** — if the DNS record itself looks correct, the problem is likely the origin (a stopped tunnel, a downed app, a misconfigured reverse proxy) rather than anything this repo manages — this check exists precisely to surface that class of problem, which the post-apply record-level verification can't see.
+
+Close the tracking issue once the hostname is reachable again — the workflow will reopen or refile it automatically if it recurs.
+
 ## Recovering from a bad `apply`
 
 If `dnscontrol push` applies something wrong (bad merge, typo that passed review, etc.):
@@ -82,6 +94,42 @@ If `dnscontrol push` applies something wrong (bad merge, typo that passed review
 4. Merge — `apply.yml` will push the fix to Cloudflare.
 
 For anything affecting mail (MX/SPF/DKIM/DMARC) or the apex A record, this round-trip can take a few minutes to propagate depending on TTLs and Cloudflare's own caching — don't assume it's still broken just because a check a few seconds after merge still shows the old behavior.
+
+## Enable DNSSEC (one-time, per zone)
+
+This is entirely a manual, out-of-band process — **nothing in `dnsconfig.js` or the `apply` flow
+touches it**. dnscontrol has a generic `AUTODNSSEC_ON` domain modifier, but dnscontrol's own
+provider docs mark Cloudflare's support for it as unverified, and in practice Cloudflare doesn't
+expose "sign this zone" as a DNS record dnscontrol can push — it's a zone-level toggle in
+Cloudflare's dashboard/API, same as `REG` here being `NewRegistrar("none")` means DS-record
+placement at the actual registrar is already outside this repo's automation.
+
+To enable DNSSEC for real:
+
+1. Cloudflare dashboard → the zone → **DNS** → **Settings** → **DNSSEC** → **Enable DNSSEC**, for
+   each zone this project manages.
+2. Confirm Cloudflare has signed the zone:
+   ```sh
+   dig DNSKEY example.com +short
+   ```
+   Should return one or more `DNSKEY` records once Cloudflare finishes signing (this can take a few
+   minutes after enabling).
+3. Get the DS record to submit at the registrar — the same Cloudflare dashboard **DNSSEC** page
+   from step 1 shows the exact DS record (key tag, algorithm, digest type, digest) to give the
+   registrar.
+4. Log in to the actual registrar for that domain (not Cloudflare) and add the DS record in its
+   DNSSEC/DS-record management page. The exact UI varies by registrar.
+5. Wait for the registrar's change to propagate up to the parent zone (can take anywhere from
+   minutes to a day depending on the registrar and TLD), then verify the full chain of trust at
+   <https://dnsviz.net/> — enter the zone name and confirm it shows a validated chain with no
+   errors. This check has to happen for real, after the DS record is live at the registrar; it
+   can't be done from a sandbox or CI.
+6. As a second check, `dig +dnssec example.com` should show the `ad` (authenticated data) flag once
+   a validating resolver has picked up the change.
+
+If step 5 ever shows a broken chain (e.g. after a key rollover at Cloudflare), the fix is almost
+always to re-check and update the DS record at the registrar to match Cloudflare's current
+DNSKEY — this repo's `dnsconfig.js` and `apply` flow don't touch either side of DNSSEC at all.
 
 ## Manually triggering an apply
 

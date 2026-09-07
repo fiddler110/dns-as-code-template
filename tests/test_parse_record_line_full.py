@@ -73,8 +73,8 @@ def test_no_trailing_comma_still_parses(mod):
     assert parsed["value"] == "1.2.3.4"
 
 
-def test_split_top_level_args_ignores_commas_in_parens():
-    import dnsctl
+def test_split_top_level_args_ignores_commas_in_parens(mod):
+    from dnsctl_lib.records import split_top_level_args
 
-    args = dnsctl.split_top_level_args('"www", "example.com.", TTL(300)')
+    args = split_top_level_args('"www", "example.com.", TTL(300)')
     assert args == ['"www"', '"example.com."', "TTL(300)"]

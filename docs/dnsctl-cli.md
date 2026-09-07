@@ -117,6 +117,11 @@ What it does, in order:
 4. Stages `dnsconfig.js` (or whatever `--files` lists), commits with your message as the commit message and PR title.
 5. Pushes the branch and opens a PR (`gh pr create`) targeting `--base` (default `main`).
 
+In team/enterprise mode (`REQUIRE_TICKET_REFERENCE: "true"` in `preview.yml`, see
+[making-changes.md#team-enterprise-mode-referencing-a-ticket](making-changes.md#teamenterprise-mode-referencing-a-ticket)),
+put the bracketed ticket ID at the front of the message you pass here, since it becomes the PR
+title — e.g. `submit "[INC0012345] Add CNAME for myapp"`.
+
 Options:
 - `--files <path> [<path> ...]` — which file(s) to stage (default: `dnsconfig.js`).
 - `--branch <name>` — explicit branch name instead of the auto-generated slug.
@@ -151,7 +156,7 @@ Interactive walkthrough example:
 
 ```
 $ python scripts/dnsctl.py record add plex.example.com
-Record type (A, CNAME, MX, TXT) [CNAME]:
+Record type (A, CNAME, MX, TXT, CAA) [CNAME]:
 target hostname for plex.example.com: example.com
 'example.com' has no trailing dot - add one? [Y/n]:
 Proxy through Cloudflare (orange cloud)? [Y/n]:
@@ -179,9 +184,10 @@ python scripts/dnsctl.py record add plex.example.com --type CNAME --value exampl
 python scripts/dnsctl.py record add mail.example.com --type MX --value mx.example.com --priority 10 --yes
 python scripts/dnsctl.py record add api.example.com --type A --value 203.0.113.10 --no-proxy --yes
 python scripts/dnsctl.py record add www --zone example.org --type CNAME --value example.org --yes
+python scripts/dnsctl.py record add example.com --type CAA --tag issue --value pki.goog --yes
 ```
 
-With `--yes`, a missing required flag (`--type`, `--value`, `--priority` for MX) is a hard error rather than a prompt — it never silently blocks waiting for input. A missing trailing dot on a CNAME/MX target is auto-appended (printed as a note), and proxy defaults to ON for A/CNAME if `--proxy`/`--no-proxy` isn't given. It also refuses to add an exact duplicate of an existing line, and warns (without blocking) if you're about to create a CNAME alongside another record type on the same name, or vice versa — CNAME can't coexist with anything else on the same name (a DNS-wide rule, not specific to this project).
+With `--yes`, a missing required flag (`--type`, `--value`, `--priority` for MX, `--tag` for CAA) is a hard error rather than a prompt — it never silently blocks waiting for input. A missing trailing dot on a CNAME/MX target is auto-appended (printed as a note), and proxy defaults to ON for A/CNAME if `--proxy`/`--no-proxy` isn't given. It also refuses to add an exact duplicate of an existing line, and warns (without blocking) if you're about to create a CNAME alongside another record type on the same name, or vice versa — CNAME can't coexist with anything else on the same name (a DNS-wide rule, not specific to this project).
 
 Removing a record works the same way:
 
@@ -200,7 +206,9 @@ python scripts/dnsctl.py record list --zone example.org        # just that zone
 python scripts/dnsctl.py record list plex.example.com       # just records for this name
 ```
 
-**Scope**: the wizard supports `A`, `CNAME`, `MX`, and `TXT` — the record types actually in use in these zones (see [record-types.md](record-types.md)). For `NS`/`CAA`/`SRV`/anything else, edit `dnsconfig.js` directly.
+**Scope**: the wizard supports `A`, `CNAME`, `MX`, `TXT`, and `CAA` — the record types most commonly in use (see [record-types.md](record-types.md)). For `NS`/`SRV`/anything else, edit `dnsconfig.js` directly.
+
+`CAA` records take `--tag {issue,issuewild,iodef}` in place of `--priority`, and `--value` is the CA hostname (e.g. `letsencrypt.org`) or, for `iodef`, a `mailto:`/`https:` URL.
 
 ### `record edit`
 
@@ -211,15 +219,15 @@ python scripts/dnsctl.py record edit plex.example.com --value newtarget.example.
 python scripts/dnsctl.py record edit api.example.com --no-proxy --yes
 ```
 
-Omitted fields (priority, proxy, TTL) keep their current value — interactively, the prompt shows the existing value as the default; non-interactively (`--yes`), whatever isn't passed as a flag is carried over unchanged. Shows a `-`/`+` diff of the exact line before writing it. Record type can't be changed this way (that's not really an "edit" — remove and re-add instead).
+Omitted fields (priority, proxy, TTL, CAA tag) keep their current value — interactively, the prompt shows the existing value as the default; non-interactively (`--yes`), whatever isn't passed as a flag is carried over unchanged. Shows a `-`/`+` diff of the exact line before writing it. Record type can't be changed this way (that's not really an "edit" — remove and re-add instead).
 
 ### `record update-ip`
 
-Bulk-replaces an IP across **every** `A` record currently pointing at it — built for the common homelab situation of a residential IP changing, where several records (e.g. the apex plus a Cloudflare tunnel or two) all point at the same address and hand-editing each one is error-prone.
+Bulk-replaces an IP across **every** `A` record currently pointing at it — built for the common situation of an IP changing, where several records (e.g. the apex plus a tunnel or two) all point at the same address and hand-editing each one is error-prone.
 
 ```sh
-python scripts/dnsctl.py record update-ip 198.51.100.10 198.51.100.20
-python scripts/dnsctl.py record update-ip 198.51.100.10 198.51.100.20 --zone example.com --yes
+python scripts/dnsctl.py record update-ip 203.0.113.10 203.0.113.50
+python scripts/dnsctl.py record update-ip 203.0.113.10 203.0.113.50 --zone example.com --yes
 ```
 
 Lists every matching record's FQDN before asking for confirmation, preserves each record's existing proxy/TTL settings, and only touches `A` records with an exact value match. Defaults to checking all managed zones; `--zone` restricts to one.
@@ -249,13 +257,17 @@ python scripts/dnsctl.py record sync-acme --zone example.com --yes
 ```
 
 Requires `.env`. Shows the full add/remove diff before asking to apply — pass `--yes` to skip the prompt and the preview/submit offer. Only touches `_acme-challenge` TXT lines; every other record in `dnsconfig.js` is untouched and still treated as authoritative in the normal (`dnsconfig.js` → Cloudflare) direction. After it runs, `prune-acme`/`preview` should report 0 drift for ACME records until the next renewal.
+
 ### `lint`
 
 Fast, offline sanity checks over `dnsconfig.js` — no dnscontrol binary, no network call, so it's cheap to run constantly (e.g. as a first check before `preview`, or wired into an editor's save hook). Catches:
 
 - An exact duplicate line appearing more than once.
-- A `CNAME`/`MX` target missing its required trailing dot.
+- A hostname-value record (`CNAME`, `MX`, `NS`, `SRV`, `ALIAS`, `PTR`) target missing its required trailing dot.
 - A `CNAME` coexisting with another record type on the same name, or more than one `CNAME` on the same name — both invalid under DNS, not just this project's convention.
+- A `CNAME` at the zone apex (`"@"`) — always invalid per DNS spec, even with no other record at that name.
+- An `A` record value that isn't a well-formed IPv4 address (4 dot-separated octets, each 0-255).
+- An explicit `TTL(...)` value that's non-positive or above a 1-week sanity ceiling (604800 seconds).
 
 ```sh
 python scripts/dnsctl.py lint
@@ -263,6 +275,18 @@ python scripts/dnsctl.py lint --zone example.org
 ```
 
 Exits non-zero if any error-level issue is found. This is a static text check only — it doesn't know what's actually live on Cloudflare, so it complements `preview` rather than replacing it (a file can pass `lint` and still show unexpected corrections under `preview` if it drifted from live state).
+
+### `fmt`
+
+Re-sorts each zone's block in `dnsconfig.js` into canonical record-type order — `A`, `CNAME`, `MX`, `TXT`, `CAA` (matching how the blocks are hand-kept by convention) — stable within a type, so a hand-picked ordering within a type (e.g. an alphabetical `CNAME` list) survives unchanged. A standalone `//` comment directly above a record travels with it when the record moves.
+
+```sh
+python scripts/dnsctl.py fmt                 # rewrite dnsconfig.js in place
+python scripts/dnsctl.py fmt --zone example.org
+python scripts/dnsctl.py fmt --check         # report only, exit non-zero if reordering is needed (used by the pre-commit hook)
+```
+
+Refuses to touch a zone block (exits non-zero, leaves the file unchanged) rather than guess if it finds something it can't safely reorder — a `DnsProvider(...)`/`DefaultTTL(...)` directive after the first record, a blank line among records, or a line it can't parse as a known record type. Purely a line-reordering tool: it never changes a record's actual content, only where its line sits in the file, so a zone that passes `fmt --check` shows zero `dnscontrol` corrections from the reorder alone.
 
 ### `show`
 

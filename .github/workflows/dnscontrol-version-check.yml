@@ -12,13 +12,18 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     env:
       GH_TOKEN: ${{ github.token }}
-      PINNED_VERSION: "4.46.0"
     steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
       - name: Compare pinned version against latest upstream release
         run: |
           set -euo pipefail
+          # Single source of truth for the pinned version - see .dnscontrol-version.
+          PINNED_VERSION="$(cat .dnscontrol-version)"
           latest=$(gh api repos/DNSControl/dnscontrol/releases/latest --jq .tag_name)
           latest="${latest#v}"
           echo "pinned=${PINNED_VERSION}" >> "$GITHUB_ENV"
@@ -32,7 +37,7 @@ jobs:
 
       - name: Open or update tracking issue
         if: env.outdated == 'true'
-        uses: actions/github-script@v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
         with:
           script: |
             const marker = '### dnscontrol version check';
@@ -60,5 +65,101 @@ jobs:
                 title: `dnscontrol ${process.env.latest} is available (pinned: ${process.env.pinned})`,
                 body,
                 labels: ['dnscontrol-version'],
+              });
+            }
+
+  # docs/operations.md's token-rotation runbook is calendar-driven and
+  # manual - nothing actually checks whether the tokens are approaching
+  # their configured expiry. Piggybacks on this workflow since it's already
+  # scheduled weekly. Uses Cloudflare's /user/tokens/verify endpoint, called
+  # once per secret using that token as its own Bearer auth, so no separate
+  # token ID needs to be stored or discovered.
+  token-expiry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check Cloudflare token expiry
+        id: expiry
+        env:
+          CLOUDFLARE_API_TOKEN_READONLY: ${{ secrets.CLOUDFLARE_API_TOKEN_READONLY }}
+          CLOUDFLARE_API_TOKEN_WRITE: ${{ secrets.CLOUDFLARE_API_TOKEN_WRITE }}
+        run: |
+          set -euo pipefail
+          warnings=""
+          for name in CLOUDFLARE_API_TOKEN_READONLY CLOUDFLARE_API_TOKEN_WRITE; do
+            token="${!name}"
+            if [ -z "$token" ]; then
+              echo "::warning::Secret $name is not set; skipping expiry check."
+              continue
+            fi
+
+            response=$(curl -sS -H "Authorization: Bearer ${token}" \
+              https://api.cloudflare.com/client/v4/user/tokens/verify)
+            success=$(jq -r '.success' <<< "$response")
+            if [ "$success" != "true" ]; then
+              echo "::warning::Could not verify $name via /user/tokens/verify: $(jq -c '.errors' <<< "$response")"
+              continue
+            fi
+
+            expires_on=$(jq -r '.result.expires_on // empty' <<< "$response")
+            if [ -z "$expires_on" ]; then
+              echo "$name has no configured expiry."
+              continue
+            fi
+
+            expires_epoch=$(date -d "$expires_on" +%s)
+            now_epoch=$(date +%s)
+            days_left=$(( (expires_epoch - now_epoch) / 86400 ))
+            echo "$name expires on $expires_on ($days_left days left)."
+
+            if [ "$days_left" -le 30 ]; then
+              warnings="${warnings}- **${name}** expires on \`${expires_on}\` (${days_left} days left)"$'\n'
+            fi
+          done
+
+          if [ -n "$warnings" ]; then
+            {
+              echo "expiring=true"
+              echo "warnings<<EOF_WARNINGS"
+              printf '%s' "$warnings"
+              echo "EOF_WARNINGS"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: File or update token-expiry issue
+        if: steps.expiry.outputs.expiring == 'true'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
+        env:
+          WARNINGS: ${{ steps.expiry.outputs.warnings }}
+        with:
+          script: |
+            const marker = '<!-- cloudflare-token-expiry-tracking-issue -->';
+            const title = 'Cloudflare API token nearing expiry';
+            const body = `${marker}\n### Cloudflare API token nearing expiry\n\n${process.env.WARNINGS}\nSee docs/operations.md for the token rotation runbook.\n\nLatest run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            const existing = await github.rest.search.issuesAndPullRequests({
+              q: `repo:${context.repo.owner}/${context.repo.repo} is:issue is:open in:body "${marker}"`,
+            });
+
+            if (existing.data.items.length > 0) {
+              const issue = existing.data.items[0];
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body,
+              });
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: `Still nearing/at expiry as of this run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
               });
             }

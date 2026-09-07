@@ -61,6 +61,48 @@ gh api repos/YOUR_USERNAME/YOUR_REPO/branches/main/protection \
 
 Set `required_approving_review_count` to `1` (or higher) instead of `0` once there's more than one maintainer who can review someone else's PR — a solo maintainer can't satisfy a required-reviewer rule on their own PRs (GitHub blocks approving your own PR), so `0` is the correct solo-maintainer value, not a placeholder to "fix later" by itself.
 
+### GitHub: enabling Merge Queue for `main`
+
+Once enough people have write access that two PRs touching `dnsconfig.js` at the same time is a
+regular occurrence rather than a rare accident, turn on GitHub's native **Merge Queue** for `main`
+instead of merging PRs one at a time by hand. This is the mechanical backstop discussed in
+[DNS_Change_Process.md#concurrency-at-scale](DNS_Change_Process.md#concurrency-at-scale) — not a
+replacement for the "keep PRs small" convention documented there.
+
+**What it does.** With merge queue enabled, clicking "merge" on a PR doesn't merge it immediately —
+it adds the PR to a queue. GitHub takes each queued PR in turn, combines it with the current `main`,
+and re-runs the required status checks (`DNS Preview`) against that up-to-date combination *before*
+actually merging it into `main`. If a PR no longer applies cleanly against latest `main`, or its
+`DNS Preview` fails once run against it (for example because an already-merged PR from the same
+queue touched an overlapping line), the queue rejects that entry instead of merging a stale or
+conflicting diff. This catches a PR that individually passed review but is now stale relative to
+what just landed — *before* merge — rather than relying solely on `apply.yml`'s "verify applied diff
+matches reviewed diff" step, which only catches that kind of drift *after* merge, at apply time. An
+ordinary git merge conflict on genuinely overlapping lines is unaffected either way — merge queue
+doesn't resolve conflicts, it just guarantees the check that runs is against current `main`, so a
+real conflict still surfaces as a queue failure a human resolves by hand.
+
+**Plan requirement.** Merge queue has the same tier restriction as real branch protection above:
+it requires a public repository, or GitHub Team/Enterprise Cloud on a private one. It is **not**
+available on GitHub Free or Pro for a private repo. Confirm the current plan supports it before
+relying on this as the mitigation — on a private repo below Team tier, `apply.yml`'s post-merge
+verify step remains the only automated safety net for stale/conflicting merges, and an
+overlapping-line conflict still surfaces as an ordinary git conflict either way.
+
+**Via the GitHub web UI:** Settings → Branches → edit the existing `main` branch protection rule
+(the one created above for `DNS Preview`) → enable **Require merge queue**. This exposes
+additional options (merge method, minimum/maximum group size, wait time before starting a new
+group) — the defaults are reasonable for most PR volumes; there's no `dnsconfig.js`-specific reason
+to tune them until queue wait times become a visible problem. `DNS Preview` must already be
+configured as a required status check (see above) for the queue to have something to re-run.
+
+**Via the API:** GitHub's branch protection REST endpoint does expose merge-queue configuration,
+but its exact field shape isn't verified here — rather than guess at a payload and risk documenting
+a call that silently no-ops or errors, set this up via the web UI above and confirm it stuck by
+checking that a queued PR actually shows a "Queued for merge" state. If scripting this into a
+repo-setup script matters later, verify the current field names against GitHub's REST API
+reference at that time rather than copying this note's guess.
+
 ## Azure DevOps: the equivalent setup
 
 If you're adapting this project to Azure DevOps (Azure Repos + Azure Pipelines) instead of GitHub, the same two concerns map onto Azure's own primitives — the names differ, the principles don't.
