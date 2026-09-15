@@ -8,6 +8,18 @@ python scripts/dnsctl.py <command> [options]
 
 (On some systems the interpreter is `python3` instead of `python` — use whichever runs Python 3 on your machine.)
 
+## Forge support (GitHub / Azure DevOps / Forgejo)
+
+The PR-lifecycle commands (`submit`, `status`, `review`, `approve`, `merge`, `begin`, `rollback`, `validate`) don't talk to `gh` directly — they go through a small forge abstraction (`scripts/dnsctl_lib/forge.py`) that auto-detects which platform this repo's `origin` remote points at:
+
+- **GitHub** (`github.com` or a GitHub Enterprise hostname) — needs the [GitHub CLI](https://cli.github.com/) (`gh`), authenticated against this repo. This is the only platform `dnsctl` was originally built against, so it's the most battle-tested path.
+- **Azure DevOps** (`dev.azure.com` or `*.visualstudio.com`) — needs the [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli) (`az`); the `azure-devops` extension installs automatically on first use. Check status is read from PR branch policies (`az repos pr policy list`), so an Azure Pipelines build-validation policy must be named "DNS Preview" for the merge gate to recognize it — the Azure DevOps equivalent of naming the GitHub Actions workflow "DNS Preview". PR review-thread comments aren't surfaced yet (`review` reports none found), and Azure DevOps doesn't block a PR author from approving their own PR the way GitHub/Forgejo do.
+- **Forgejo/Gitea** (anything else) — needs a personal access token with repo read/write scope in `FORGEJO_TOKEN` (`.env` or the environment). Talks to the instance's REST API directly (stdlib `urllib`, no extra CLI dependency).
+
+Override auto-detection with `DNSCTL_FORGE=github|azuredevops|forgejo` in `.env` or the environment (same precedence as every other `DNSCTL_*` team-mode setting).
+
+**CI-run watching stays GitHub-only for now.** `validate` and `merge --wait` waiting for the actual `DNS Apply`/pipeline/workflow run to finish uses `gh run list`/`gh run watch`; on Azure DevOps or Forgejo this step is skipped with a note, and `dnsctl` goes straight to comparing live Cloudflare state against `dnsconfig.js` instead. Everything else (opening/listing/reviewing/approving/merging PRs) works identically across all three. `doctor` reports which forge was detected and whether it's ready to use.
+
 ## Commands
 
 ### `doctor`

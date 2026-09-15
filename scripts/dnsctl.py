@@ -43,8 +43,12 @@ Commands:
                          record-type order (A, CNAME, MX, TXT, CAA).
     show                Table view of all records (terminal, CSV, or Markdown).
 
-The submit/status/review/approve/merge commands require the GitHub CLI
-(`gh`, https://cli.github.com/), authenticated against this repo.
+The submit/status/review/approve/merge/begin/rollback/validate commands need
+a forge CLI/credential for whichever platform this repo's `origin` remote
+points at - GitHub CLI (`gh`, authenticated against this repo), Azure CLI
+(`az`, for Azure DevOps), or a FORGEJO_TOKEN (for a self-hosted Forgejo/Gitea
+instance). Auto-detected from the remote URL; override with DNSCTL_FORGE.
+See docs/dnsctl-cli.md#forge-support-github--azure-devops--forgejo.
 
 Run `python scripts/dnsctl.py <command> --help` for command-specific options.
 """
@@ -75,6 +79,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from dnsctl_lib import env as env_lib
+from dnsctl_lib import forge as forge_lib
 from dnsctl_lib import install, procutil, records, render
 from dnsctl_lib.cli_utils import (
     RECORD_VALUE_LABELS,
@@ -91,15 +96,14 @@ from dnsctl_lib.cli_utils import (
     split_pr_checks,
 )
 from dnsctl_lib.env import has_cloudflare_token, load_env_file, require_cloudflare_token
+from dnsctl_lib.forge import GithubForge
 from dnsctl_lib.procutil import (
     exe_name,
     find_dnscontrol,
     gh,
     git,
     git_output,
-    have_gh,
     require_clean_worktree,
-    require_gh,
     run_dnscontrol,
 )
 from dnsctl_lib.records import (
@@ -141,6 +145,15 @@ DNSCONTROL_VERSION = DNSCONTROL_VERSION_FILE.read_text(encoding="utf-8").strip()
 
 def load_cloudflare_env(env_file: Path = ENV_FILE) -> dict:
     return env_lib.load_cloudflare_env(env_file)
+
+
+def active_forge() -> forge_lib.Forge:
+    """The Forge (GitHub/Azure DevOps/Forgejo) for this repo's `origin`
+    remote - DNSCTL_FORGE (.env or the environment) overrides auto-detection.
+    See dnsctl_lib/forge.py. CI-run watching (validate/merge --wait) stays
+    GitHub-only regardless of which Forge this returns - see validate_apply."""
+    local_env = load_env_file(ENV_FILE) if ENV_FILE.is_file() else {}
+    return forge_lib.get_forge(local_env)
 
 
 def detect_zone(spec: str) -> str | None:
@@ -390,13 +403,19 @@ def cmd_doctor(_args) -> int:
         print("[FAIL] creds.json not found.")
         ok = False
 
-    if have_gh():
-        print("[ok]   GitHub CLI ('gh') found on PATH.")
-    else:
+    forge = active_forge()
+    if forge.available():
         print(
-            "[warn] GitHub CLI ('gh') not found on PATH - submit, status, review, approve, "
-            "merge, begin, rollback, and validate all need it. Install it: "
-            "https://cli.github.com/"
+            f"[ok]   Detected forge: {forge.display_name} (origin: "
+            f"{forge_lib.get_origin_url() or '(no origin remote)'}) - ready for "
+            "submit/status/review/approve/merge/begin/rollback/validate."
+        )
+    else:
+        print(f"[warn] Detected forge: {forge.display_name}, but not ready:")
+        print(f"       {forge.unavailable_message()}")
+        print(
+            "       (Auto-detected from origin's remote URL - override with DNSCTL_FORGE "
+            "in .env if this is wrong, e.g. DNSCTL_FORGE=github|azuredevops|forgejo.)"
         )
 
     if vault and not shutil.which("az"):
@@ -588,7 +607,8 @@ def cmd_import(args) -> int:
 
 
 def cmd_submit(args) -> int:
-    if not require_gh():
+    forge = active_forge()
+    if not forge.require():
         return 1
 
     status = git_output(["status", "--porcelain"])
@@ -680,18 +700,11 @@ def cmd_submit(args) -> int:
         return push_result.returncode
 
     print("Opening pull request...")
-    pr_args = [
-        "pr", "create",
-        "--title", args.message,
-        "--body", args.body or "",
-        "--base", base_branch,
-        "--head", branch,
-    ]
-    result = gh(pr_args)
+    result = forge.pr_create(args.message, args.body or "", base_branch, branch)
     if result.returncode != 0:
-        eprint(result.stderr.strip() or result.stdout.strip())
+        eprint(result.error)
         return result.returncode
-    print(result.stdout.strip())
+    print(result.data)
 
     print(
         "\nNext: wait for the 'DNS Preview' check (python scripts/dnsctl.py status), "
@@ -702,18 +715,16 @@ def cmd_submit(args) -> int:
 
 
 def cmd_status(_args) -> int:
-    if not require_gh():
+    forge = active_forge()
+    if not forge.require():
         return 1
 
-    result = gh([
-        "pr", "list", "--state", "open",
-        "--json", "number,title,headRefName,url,isDraft,statusCheckRollup",
-    ])
+    result = forge.pr_list_open()
     if result.returncode != 0:
-        eprint(result.stderr.strip())
+        eprint(result.error)
         return result.returncode
 
-    prs = json.loads(result.stdout)
+    prs = result.data
     if not prs:
         print("No open pull requests.")
         return 0
@@ -743,26 +754,26 @@ def cmd_status(_args) -> int:
 
 
 def cmd_review(args) -> int:
-    if not require_gh():
+    forge = active_forge()
+    if not forge.require():
         return 1
 
     number = str(args.pr)
 
     print(f"=== dnsconfig.js diff for PR #{number} ===")
-    diff_result = gh(["pr", "diff", number])
+    diff_result = forge.pr_diff(number)
     if diff_result.returncode != 0:
-        eprint(diff_result.stderr.strip())
+        eprint(diff_result.error)
         return diff_result.returncode
-    print(diff_result.stdout or "(no diff)")
+    print(diff_result.data or "(no diff)")
 
     print(f"\n=== DNS Preview comment for PR #{number} ===")
-    view_result = gh(["pr", "view", number, "--json", "comments"])
-    if view_result.returncode != 0:
-        eprint(view_result.stderr.strip())
-        return view_result.returncode
+    comments_result = forge.pr_comments(number)
+    if comments_result.returncode != 0:
+        eprint(comments_result.error)
+        return comments_result.returncode
 
-    data = json.loads(view_result.stdout)
-    comments = data.get("comments", [])
+    comments = comments_result.data
     preview_comments = [
         c for c in comments if "dnscontrol preview" in (c.get("body") or "").lower()
     ]
@@ -774,42 +785,41 @@ def cmd_review(args) -> int:
 
 
 def cmd_approve(args) -> int:
-    if not require_gh():
+    forge = active_forge()
+    if not forge.require():
         return 1
 
     number = str(args.pr)
-    result = gh(["pr", "review", number, "--approve", "--body", args.body or ""])
+    result = forge.pr_approve(number, args.body or "")
     if result.returncode != 0:
-        stderr = result.stderr.strip()
-        if "own pull request" in stderr.lower():
+        if result.self_approval_blocked:
             print(
-                "GitHub does not allow approving your own pull request - this will "
+                f"{forge.display_name} does not allow approving your own pull request - this will "
                 "always happen on a solo-maintained repo like this one.\n"
                 "This repo has no required-review branch rule, so approval isn't "
                 "needed to merge anyway - once the DNS Preview check has passed, run:\n"
                 f"  python scripts/dnsctl.py merge {number}"
             )
             return 1
-        eprint(stderr or result.stdout.strip())
+        eprint(result.error)
         return result.returncode
-    print(result.stdout.strip())
+    print(result.data)
     return 0
 
 
 def cmd_merge(args) -> int:
-    if not require_gh():
+    forge = active_forge()
+    if not forge.require():
         return 1
 
     number = str(args.pr)
 
-    view_result = gh(
-        ["pr", "view", number, "--json", "state,statusCheckRollup,title,author,reviews"]
-    )
+    view_result = forge.pr_view(number)
     if view_result.returncode != 0:
-        eprint(view_result.stderr.strip())
+        eprint(view_result.error)
         return view_result.returncode
 
-    data = json.loads(view_result.stdout)
+    data = view_result.data
     if data.get("state") != "OPEN":
         eprint(f"error: PR #{number} is not open (state: {data.get('state')}).")
         return 1
@@ -876,8 +886,8 @@ def cmd_merge(args) -> int:
 
     print(f'PR #{number}: "{data.get("title")}"')
     print(
-        "Merging will trigger the 'DNS Apply' GitHub Actions workflow, which applies "
-        f"this change to the live Cloudflare zone(s) managed here ({', '.join(ZONES)})."
+        "Merging will trigger the 'DNS Apply' CI workflow, which applies this change to "
+        f"the live Cloudflare zone(s) managed here ({', '.join(ZONES)})."
     )
     if not args.yes and not confirm_or_abort(
         'Type "MERGE" to continue, anything else to abort: ', "MERGE"
@@ -885,8 +895,9 @@ def cmd_merge(args) -> int:
         print("Aborted.")
         return 1
 
-    result = gh(["pr", "merge", number, "--merge", "--delete-branch"], capture=False)
+    result = forge.pr_merge(number)
     if result.returncode != 0:
+        eprint(result.error)
         return result.returncode
 
     if not args.wait:
@@ -897,13 +908,31 @@ def cmd_merge(args) -> int:
         )
         return 0
 
+    if not isinstance(forge, GithubForge):
+        print(
+            f"Merged. Waiting for a CI run to finish isn't implemented yet for "
+            f"{forge.display_name} (--wait is GitHub-only for now) - confirming live "
+            "state directly instead...\n"
+        )
+        if not sync_local_main():
+            return 1
+        env = load_cloudflare_env()
+        rc = run_dnscontrol(["preview", "--expect-no-changes"], env)
+        if rc != 0:
+            eprint(
+                "error: live Cloudflare state does not match dnsconfig.js - see the diff "
+                "above. Confirm the merge actually applied (check your CI system), then "
+                "investigate."
+            )
+        return rc
+
     print("Merged. Waiting for 'DNS Apply' to run and confirming live state...\n")
     return validate_apply(number, args.timeout)
 
 
 def cmd_begin(args) -> int:
     """Start a new DNS change: sync main, catch drift, create a branch."""
-    if not require_gh():
+    if not active_forge().require():
         return 1
 
     if not require_clean_worktree("starting a new DNS change"):
@@ -997,16 +1026,17 @@ def cmd_history(args) -> int:
     return 0
 
 
-def resolve_revert_target(target: str) -> tuple[str, bool] | None:
+def resolve_revert_target(target: str, forge: forge_lib.Forge | None = None) -> tuple[str, bool] | None:
     """Resolve a PR number or commit-ish to (sha, is_merge_commit)."""
     if re.fullmatch(r"\d+", target):
-        if not require_gh():
+        forge = forge or active_forge()
+        if not forge.require():
             return None
-        result = gh(["pr", "view", target, "--json", "mergeCommit,state"])
+        result = forge.pr_view(target)
         if result.returncode != 0:
-            eprint(result.stderr.strip() or result.stdout.strip())
+            eprint(result.error)
             return None
-        data = json.loads(result.stdout)
+        data = result.data
         if data.get("state") != "MERGED":
             eprint(f"error: PR #{target} is not merged (state: {data.get('state')}).")
             return None
@@ -1028,13 +1058,14 @@ def resolve_revert_target(target: str) -> tuple[str, bool] | None:
 
 def cmd_rollback(args) -> int:
     """Revert a previously-merged dnsconfig.js change via a new PR (never pushes to main)."""
-    if not require_gh():
+    forge = active_forge()
+    if not forge.require():
         return 1
 
     if not require_clean_worktree("starting a rollback"):
         return 1
 
-    resolved = resolve_revert_target(args.target)
+    resolved = resolve_revert_target(args.target, forge)
     if resolved is None:
         return 1
     target_sha, is_merge = resolved
@@ -1087,14 +1118,11 @@ def cmd_rollback(args) -> int:
         "Opened by `dnsctl.py rollback` - review the DNS Preview diff before merging, "
         "exactly like any other DNS change."
     )
-    result = gh([
-        "pr", "create", "--title", f"Revert: {subject}", "--body", pr_body,
-        "--base", base, "--head", branch,
-    ])
+    result = forge.pr_create(f"Revert: {subject}", pr_body, base, branch)
     if result.returncode != 0:
-        eprint(result.stderr.strip() or result.stdout.strip())
+        eprint(result.error)
         return result.returncode
-    print(result.stdout.strip())
+    print(result.data)
     print(
         "\nNext: python scripts/dnsctl.py status / review <PR#> / merge <PR#> - "
         "same as any other change."
@@ -1145,7 +1173,7 @@ def commit_triggers_apply(sha: str) -> bool | None:
     return bool(changed & APPLY_TRIGGER_PATHS)
 
 
-def resolve_validate_target_sha(target: str | None) -> str | None:
+def resolve_validate_target_sha(target: str | None, forge: forge_lib.Forge | None = None) -> str | None:
     """Resolve what `validate` should check: an explicit PR number/commit
     (via the same PR-or-commit resolution `rollback` uses), or - if omitted -
     the (now-synced) local tip of main."""
@@ -1153,7 +1181,7 @@ def resolve_validate_target_sha(target: str | None) -> str | None:
         sha = git_output(["rev-parse", "main"])
         return sha or None
 
-    resolved = resolve_revert_target(target)
+    resolved = resolve_revert_target(target, forge)
     if resolved is None:
         return None
     return resolved[0]
@@ -1166,16 +1194,21 @@ def validate_apply(target: str | None, timeout: int) -> int:
     This is the automated version of what merging a PR otherwise leaves as a
     manual "go check the Actions tab" step.
 
+    Waiting for the CI run itself is GitHub-only for now (gh's `run list`/
+    `run watch` - see dnsctl_lib/forge.py's module docstring); on any other
+    Forge this skips straight to the live-state comparison below.
+
     Always compares against the *current* main, not whatever dnsconfig.js
     looked like at the target commit - what actually matters after any apply
     is "does live state match main's dnsconfig.js right now," regardless of
     which past commit's DNS Apply run triggered this check."""
-    if not require_gh():
+    forge = active_forge()
+    if not forge.require():
         return 1
     if not sync_local_main():
         return 1
 
-    sha = resolve_validate_target_sha(target)
+    sha = resolve_validate_target_sha(target, forge)
     if sha is None:
         return 1
     short = sha[:8]
@@ -1187,6 +1220,11 @@ def validate_apply(target: str | None, timeout: int) -> int:
             "Apply' never runs for it (see the `paths:` filter in "
             ".github/workflows/apply.yml) - nothing to wait for.\n"
             "Confirming live Cloudflare still matches the current dnsconfig.js anyway..."
+        )
+    elif not isinstance(forge, GithubForge):
+        print(
+            f"Waiting for a CI run to finish isn't implemented yet for {forge.display_name} "
+            "- confirming live Cloudflare state directly instead..."
         )
     else:
         print("Looking for the 'DNS Apply' workflow run for this commit...")

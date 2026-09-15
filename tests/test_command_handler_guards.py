@@ -5,19 +5,17 @@ of these had any test coverage before, only the pure helpers they call
 require_clean_worktree) were tested in isolation (tests/test_cli_utils.py,
 tests/test_env.py, tests/test_procutil.py).
 
-These tests mock every git/gh/dnscontrol-touching call (git, git_output, gh,
-require_gh, require_clean_worktree, procutil.sync_branch, run_dnscontrol,
-load_cloudflare_env, require_cloudflare_token) at the dnsctl module level -
-following the `_fake_gh_pr_view`-style faking already used in
-tests/test_commit_helpers.py - so no test here ever touches a real git repo,
-GitHub, or the network. The goal is to prove the *handlers* actually call
-these guards and stop when they fail/refuse, not just that the guards work in
-isolation.
+These tests mock every git/forge/dnscontrol-touching call (git, git_output,
+active_forge via the `fake_forge` fixture - see conftest.py's FakeForge,
+require_clean_worktree, procutil.sync_branch, run_dnscontrol,
+load_cloudflare_env, require_cloudflare_token) at the dnsctl module level, so
+no test here ever touches a real git repo, a real forge, or the network. The
+goal is to prove the *handlers* actually call these guards and stop when they
+fail/refuse, not just that the guards work in isolation.
 """
 from __future__ import annotations
 
 import argparse
-import json
 
 
 def _cp(returncode=0, stdout="", stderr=""):
@@ -29,8 +27,8 @@ def _cp(returncode=0, stdout="", stderr=""):
 # --- confirm/abort paths, exercised through the command handlers -----------
 
 
-def test_cmd_submit_aborts_when_diff_confirmation_declined(mod, monkeypatch, capsys):
-    monkeypatch.setattr(mod, "require_gh", lambda: True)
+def test_cmd_submit_aborts_when_diff_confirmation_declined(mod, monkeypatch, fake_forge, capsys):
+    fake_forge()
     monkeypatch.setattr(mod, "git_output", lambda args: "M dnsconfig.js")
     monkeypatch.setattr(mod, "cmd_preview", lambda _args: 0)
 
@@ -56,8 +54,8 @@ class _FakePath:
         return True
 
 
-def test_cmd_submit_blocks_when_ticket_reference_required_and_missing(mod, monkeypatch, capsys):
-    monkeypatch.setattr(mod, "require_gh", lambda: True)
+def test_cmd_submit_blocks_when_ticket_reference_required_and_missing(mod, monkeypatch, fake_forge, capsys):
+    fake_forge()
     monkeypatch.setattr(mod, "git_output", lambda args: "M dnsconfig.js")
     monkeypatch.setattr(mod, "ENV_FILE", _FakePath())
     monkeypatch.setattr(
@@ -78,8 +76,8 @@ def test_cmd_submit_blocks_when_ticket_reference_required_and_missing(mod, monke
     assert git_calls == []
 
 
-def test_cmd_submit_allows_ticket_reference_in_message(mod, monkeypatch, capsys):
-    monkeypatch.setattr(mod, "require_gh", lambda: True)
+def test_cmd_submit_allows_ticket_reference_in_message(mod, monkeypatch, fake_forge, capsys):
+    fake_forge()
     monkeypatch.setattr(mod, "git_output", lambda args: "M dnsconfig.js")
     monkeypatch.setattr(mod, "ENV_FILE", _FakePath())
     monkeypatch.setattr(
@@ -131,48 +129,37 @@ def test_cmd_push_aborts_when_apply_confirmation_declined(mod, monkeypatch, caps
     assert run_calls == []
 
 
-def test_cmd_merge_aborts_when_merge_confirmation_declined(mod, monkeypatch, capsys):
-    monkeypatch.setattr(mod, "require_gh", lambda: True)
+def _pr_view_result(mod, **overrides):
+    data = {
+        "state": "OPEN",
+        "title": "Some change",
+        "author": {"login": "bob"},
+        "reviews": [],
+        "statusCheckRollup": [{"name": "DNS Preview", "conclusion": "SUCCESS"}],
+    }
+    data.update(overrides)
+    return mod.forge_lib.ForgeResult(0, data=data)
 
-    gh_calls = []
 
-    def fake_gh(args, **kw):
-        gh_calls.append(args)
-        if args[:2] == ["pr", "view"]:
-            return _cp(stdout=json.dumps({
-                "state": "OPEN",
-                "title": "Some change",
-                "statusCheckRollup": [{"name": "DNS Preview", "conclusion": "SUCCESS"}],
-            }))
-        raise AssertionError(f"unexpected gh call after abort: {args}")
-
-    monkeypatch.setattr(mod, "gh", fake_gh)
+def test_cmd_merge_aborts_when_merge_confirmation_declined(mod, monkeypatch, fake_forge, capsys):
+    forge = fake_forge(pr_view=_pr_view_result(mod))
     monkeypatch.setattr(mod, "confirm_or_abort", lambda *a, **k: False)
 
     args = argparse.Namespace(pr=42, force=False, yes=False, wait=False, timeout=300)
 
     assert mod.cmd_merge(args) == 1
     assert "Aborted." in capsys.readouterr().out
-    # Only the initial `pr view` call should have happened - no `pr merge`.
-    assert gh_calls == [["pr", "view", "42", "--json", "state,statusCheckRollup,title,author,reviews"]]
+    # Only the initial pr_view call should have happened - no pr_merge.
+    assert forge.calls == [("pr_view", ("42",))]
 
 
-def test_cmd_merge_blocks_when_no_preview_check_found(mod, monkeypatch, capsys):
+def test_cmd_merge_blocks_when_no_preview_check_found(mod, monkeypatch, fake_forge, capsys):
     """A PR with no DNS Preview check at all (not yet run, or misconfigured)
     must require --force just like a failed one - it must not fall through
     to the merge confirmation on its own."""
-    monkeypatch.setattr(mod, "require_gh", lambda: True)
-
-    def fake_gh(args, **kw):
-        if args[:2] == ["pr", "view"]:
-            return _cp(stdout=json.dumps({
-                "state": "OPEN",
-                "title": "Some change",
-                "statusCheckRollup": [{"name": "lint", "conclusion": "SUCCESS"}],
-            }))
-        raise AssertionError(f"unexpected gh call: {args}")
-
-    monkeypatch.setattr(mod, "gh", fake_gh)
+    fake_forge(pr_view=_pr_view_result(
+        mod, statusCheckRollup=[{"name": "lint", "conclusion": "SUCCESS"}],
+    ))
     monkeypatch.setattr(mod, "confirm_or_abort", lambda *a, **k: True)
 
     args = argparse.Namespace(pr=42, force=False, yes=False, wait=False, timeout=300)
@@ -188,59 +175,35 @@ class _FakePath:
         return True
 
 
-def test_cmd_merge_blocks_when_non_author_review_required_and_missing(mod, monkeypatch, capsys):
-    monkeypatch.setattr(mod, "require_gh", lambda: True)
+def test_cmd_merge_blocks_when_non_author_review_required_and_missing(mod, monkeypatch, fake_forge, capsys):
+    forge = fake_forge(pr_view=_pr_view_result(
+        mod,
+        author={"login": "bob"},
+        reviews=[{"author": {"login": "bob"}, "state": "APPROVED", "submittedAt": "2026-01-01T00:00:00Z"}],
+    ))
     monkeypatch.setattr(mod, "ENV_FILE", _FakePath())
     monkeypatch.setattr(
         mod, "load_env_file", lambda _path: {"DNSCTL_REQUIRE_NON_AUTHOR_REVIEW": "true"}
     )
-
-    merge_called = []
-
-    def fake_gh(args, **kw):
-        if args[:2] == ["pr", "view"]:
-            return _cp(stdout=json.dumps({
-                "state": "OPEN",
-                "title": "Some change",
-                "author": {"login": "bob"},
-                "reviews": [
-                    {"author": {"login": "bob"}, "state": "APPROVED", "submittedAt": "2026-01-01T00:00:00Z"},
-                ],
-                "statusCheckRollup": [{"name": "DNS Preview", "conclusion": "SUCCESS"}],
-            }))
-        merge_called.append(args)
-        raise AssertionError(f"unexpected gh call: {args}")
-
-    monkeypatch.setattr(mod, "gh", fake_gh)
 
     args = argparse.Namespace(pr=42, force=False, yes=False, wait=False, timeout=300)
 
     assert mod.cmd_merge(args) == 1
     assert "no APPROVED review" in capsys.readouterr().err
-    assert merge_called == []
+    assert forge.calls == [("pr_view", ("42",))]
 
 
-def test_cmd_merge_allows_when_non_author_review_present(mod, monkeypatch, capsys):
-    monkeypatch.setattr(mod, "require_gh", lambda: True)
+def test_cmd_merge_allows_when_non_author_review_present(mod, monkeypatch, fake_forge, capsys):
+    fake_forge(pr_view=_pr_view_result(
+        mod,
+        author={"login": "bob"},
+        reviews=[{"author": {"login": "alice"}, "state": "APPROVED", "submittedAt": "2026-01-01T00:00:00Z"}],
+    ))
     monkeypatch.setattr(mod, "ENV_FILE", _FakePath())
     monkeypatch.setattr(
         mod, "load_env_file", lambda _path: {"DNSCTL_REQUIRE_NON_AUTHOR_REVIEW": "true"}
     )
     monkeypatch.setattr(mod, "confirm_or_abort", lambda *a, **k: False)
-
-    def fake_gh(args, **kw):
-        assert args[:2] == ["pr", "view"]
-        return _cp(stdout=json.dumps({
-            "state": "OPEN",
-            "title": "Some change",
-            "author": {"login": "bob"},
-            "reviews": [
-                {"author": {"login": "alice"}, "state": "APPROVED", "submittedAt": "2026-01-01T00:00:00Z"},
-            ],
-            "statusCheckRollup": [{"name": "DNS Preview", "conclusion": "SUCCESS"}],
-        }))
-
-    monkeypatch.setattr(mod, "gh", fake_gh)
 
     args = argparse.Namespace(pr=42, force=False, yes=False, wait=False, timeout=300)
 
@@ -252,10 +215,10 @@ def test_cmd_merge_allows_when_non_author_review_present(mod, monkeypatch, capsy
     assert "Aborted." in out_err.out
 
 
-def test_cmd_rollback_aborts_when_diff_confirmation_declined(mod, monkeypatch, capsys):
-    monkeypatch.setattr(mod, "require_gh", lambda: True)
+def test_cmd_rollback_aborts_when_diff_confirmation_declined(mod, monkeypatch, fake_forge, capsys):
+    fake_forge()
     monkeypatch.setattr(mod, "require_clean_worktree", lambda _ctx: True)
-    monkeypatch.setattr(mod, "resolve_revert_target", lambda target: ("abc12345", False))
+    monkeypatch.setattr(mod, "resolve_revert_target", lambda target, forge=None: ("abc12345", False))
     monkeypatch.setattr(mod.procutil, "sync_branch", lambda *a, **k: True)
     monkeypatch.setattr(mod, "git_output", lambda args: "Some commit subject")
 
@@ -283,8 +246,8 @@ def test_cmd_rollback_aborts_when_diff_confirmation_declined(mod, monkeypatch, c
 # --- clean-worktree guard, exercised through begin/rollback -----------------
 
 
-def test_cmd_begin_stops_when_worktree_dirty(mod, monkeypatch):
-    monkeypatch.setattr(mod, "require_gh", lambda: True)
+def test_cmd_begin_stops_when_worktree_dirty(mod, monkeypatch, fake_forge):
+    fake_forge()
     monkeypatch.setattr(mod, "require_clean_worktree", lambda _ctx: False)
 
     sync_calls = []
@@ -296,13 +259,14 @@ def test_cmd_begin_stops_when_worktree_dirty(mod, monkeypatch):
     assert sync_calls == []
 
 
-def test_cmd_rollback_stops_when_worktree_dirty(mod, monkeypatch):
-    monkeypatch.setattr(mod, "require_gh", lambda: True)
+def test_cmd_rollback_stops_when_worktree_dirty(mod, monkeypatch, fake_forge):
+    fake_forge()
     monkeypatch.setattr(mod, "require_clean_worktree", lambda _ctx: False)
 
     resolve_calls = []
     monkeypatch.setattr(
-        mod, "resolve_revert_target", lambda target: resolve_calls.append(target) or ("x", False)
+        mod, "resolve_revert_target",
+        lambda target, forge=None: resolve_calls.append(target) or ("x", False),
     )
 
     args = argparse.Namespace(target="42", yes=True)

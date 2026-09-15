@@ -1,9 +1,9 @@
 """Tests for TOOL-15: every subprocess/procutil call that can hang on a
 network operation or another external process gets a `timeout=`, and a
 subprocess.TimeoutExpired is caught and turned into a clean, non-zero-exit
-error - never a raw traceback. Also covers cmd_merge's `gh pr merge` call
-being routed through the same require_gh() guard used by every other
-gh-touching command, instead of raising an uncaught FileNotFoundError when
+error - never a raw traceback. Also covers cmd_merge's `pr_merge` call being
+routed through the same forge.require() guard used by every other
+forge-touching command, instead of raising an uncaught FileNotFoundError when
 `gh` isn't installed.
 """
 from __future__ import annotations
@@ -86,6 +86,7 @@ def test_doctor_dnscontrol_version_timeout_does_not_crash(mod, monkeypatch, caps
     monkeypatch.setattr(mod, "load_env_file", lambda path: {"CLOUDFLARE_API_TOKEN": "x"})
     monkeypatch.setattr(mod.procutil, "have_gh", lambda: True)
     monkeypatch.setattr(mod, "git_output", lambda args: ".githooks")
+    monkeypatch.setattr(mod.forge_lib, "get_origin_url", lambda: "https://github.com/example/repo.git")
     monkeypatch.setattr(mod.env_lib, "load_env_file", lambda path: {"CLOUDFLARE_API_TOKEN": "x"})
 
     rc = mod.cmd_doctor(argparse.Namespace())
@@ -111,20 +112,22 @@ def test_fetch_keyvault_secret_timeout_returns_none_not_raise(mod, monkeypatch, 
     assert "Traceback" not in err
 
 
-# --- cmd_merge routed through require_gh() ----------------------------------
+# --- cmd_merge routed through forge.require() -------------------------------
 
 
 def test_cmd_merge_when_gh_missing_prints_clean_error_not_traceback(mod, monkeypatch, capsys):
-    """Regression test for the bug TOOL-15 fixes: cmd_merge's `gh pr merge`
-    call used to bypass the require_gh() guard every other gh-touching
-    command uses, so a missing `gh` binary raised an uncaught
-    FileNotFoundError instead of the standard clean error message."""
+    """Regression test for the bug TOOL-15 fixes: cmd_merge's `pr_merge` call
+    used to bypass the require_gh() guard every other gh-touching command
+    uses, so a missing `gh` binary raised an uncaught FileNotFoundError
+    instead of the standard clean error message. Now that guard is
+    forge.require() (see dnsctl_lib/forge.py), reached the same way."""
     monkeypatch.setattr(mod.procutil, "have_gh", lambda: False)
+    monkeypatch.setattr(mod.forge_lib, "get_origin_url", lambda: "https://github.com/example/repo.git")
 
     def fail_if_called(*args, **kwargs):
         raise FileNotFoundError("gh not found - this should never be reached")
 
-    monkeypatch.setattr(mod, "gh", fail_if_called)
+    monkeypatch.setattr(mod.procutil, "gh", fail_if_called)
 
     rc = mod.cmd_merge(argparse.Namespace(pr=1, force=False, yes=True, wait=False, timeout=300))
 
@@ -135,10 +138,13 @@ def test_cmd_merge_when_gh_missing_prints_clean_error_not_traceback(mod, monkeyp
 
 def test_cmd_merge_gh_missing_matches_other_commands_guard_message(mod, monkeypatch, capsys):
     """cmd_merge's error message on a missing `gh` should be identical to
-    every other require_gh()-guarded command's (e.g. cmd_status), not a
+    every other forge.require()-guarded command's (e.g. cmd_status), not a
     bespoke one - confirming it really does go through the same guard."""
     monkeypatch.setattr(mod.procutil, "have_gh", lambda: False)
-    monkeypatch.setattr(mod, "gh", lambda *a, **k: (_ for _ in ()).throw(AssertionError("unreachable")))
+    monkeypatch.setattr(mod.forge_lib, "get_origin_url", lambda: "https://github.com/example/repo.git")
+    monkeypatch.setattr(
+        mod.procutil, "gh", lambda *a, **k: (_ for _ in ()).throw(AssertionError("unreachable"))
+    )
 
     mod.cmd_merge(argparse.Namespace(pr=1, force=False, yes=True, wait=False, timeout=300))
     merge_err = capsys.readouterr().err

@@ -1,17 +1,17 @@
-"""Tests for the git/gh-facing helpers in dnsctl.py that back `validate` and
-`rollback`: commit_triggers_apply and resolve_revert_target. Also carries a
-fetch_live_acme_snapshot regression test (a shipped NameError lived in
+"""Tests for the git/forge-facing helpers in dnsctl.py that back `validate`
+and `rollback`: commit_triggers_apply and resolve_revert_target. Also carries
+a fetch_live_acme_snapshot regression test (a shipped NameError lived in
 exactly this kind of untested path).
 
 commit_triggers_apply/resolve_revert_target's commit-ish resolution is
 exercised against a real throwaway git repo (not mocked) by pointing
 dnsctl_lib.procutil.REPO_ROOT at a tmp_path repo, since procutil.git()/
-git_output() always run against that module-level constant. Only the `gh`
-calls (no real GitHub to talk to here) are faked.
+git_output() always run against that module-level constant. The PR-number
+path (no real forge to talk to here) is faked via the `fake_forge` fixture
+(conftest.py's FakeForge).
 """
 from __future__ import annotations
 
-import json
 import subprocess
 from pathlib import Path
 
@@ -105,7 +105,7 @@ def test_commit_triggers_apply_none_when_commit_has_no_parent(mod, repo):
     assert mod.commit_triggers_apply(repo["a"]) is None
 
 
-# --- resolve_revert_target: commit-ish path (real git, no gh involved) ----
+# --- resolve_revert_target: commit-ish path (real git, no forge involved) --
 
 
 def test_resolve_revert_target_single_parent_commit(mod, repo):
@@ -124,59 +124,43 @@ def test_resolve_revert_target_invalid_commit_returns_none(mod, repo):
     assert mod.resolve_revert_target("not-a-real-ref") is None
 
 
-# --- resolve_revert_target: PR-number path (gh faked) ---------------------
+# --- resolve_revert_target: PR-number path (forge faked) -------------------
 
 
-def _fake_gh_pr_view(returncode=0, stdout="", stderr=""):
-    def _gh(args):
-        return subprocess.CompletedProcess(args=args, returncode=returncode, stdout=stdout, stderr=stderr)
-
-    return _gh
-
-
-def test_resolve_revert_target_pr_number_resolves_merge_commit(mod, monkeypatch, repo):
-    monkeypatch.setattr(mod, "require_gh", lambda: True)
-    monkeypatch.setattr(
-        mod, "gh",
-        _fake_gh_pr_view(stdout=json.dumps({"state": "MERGED", "mergeCommit": {"oid": repo["b"]}})),
-    )
+def test_resolve_revert_target_pr_number_resolves_merge_commit(mod, fake_forge, repo):
+    fake_forge(pr_view=mod.forge_lib.ForgeResult(
+        0, data={"state": "MERGED", "mergeCommit": {"oid": repo["b"]}}
+    ))
     assert mod.resolve_revert_target("42") == (repo["b"], False)
 
 
-def test_resolve_revert_target_pr_number_not_merged_returns_none(mod, monkeypatch, repo):
-    monkeypatch.setattr(mod, "require_gh", lambda: True)
-    monkeypatch.setattr(
-        mod, "gh",
-        _fake_gh_pr_view(stdout=json.dumps({"state": "OPEN", "mergeCommit": None})),
-    )
+def test_resolve_revert_target_pr_number_not_merged_returns_none(mod, fake_forge, repo):
+    fake_forge(pr_view=mod.forge_lib.ForgeResult(
+        0, data={"state": "OPEN", "mergeCommit": None}
+    ))
     assert mod.resolve_revert_target("42") is None
 
 
-def test_resolve_revert_target_pr_number_gh_failure_returns_none(mod, monkeypatch, repo):
-    monkeypatch.setattr(mod, "require_gh", lambda: True)
-    monkeypatch.setattr(mod, "gh", _fake_gh_pr_view(returncode=1, stderr="not found"))
+def test_resolve_revert_target_pr_number_forge_failure_returns_none(mod, fake_forge, repo):
+    fake_forge(pr_view=mod.forge_lib.ForgeResult(1, error="not found"))
     assert mod.resolve_revert_target("42") is None
 
 
-def test_resolve_revert_target_pr_number_missing_merge_commit_returns_none(mod, monkeypatch, repo):
-    monkeypatch.setattr(mod, "require_gh", lambda: True)
-    monkeypatch.setattr(
-        mod, "gh",
-        _fake_gh_pr_view(stdout=json.dumps({"state": "MERGED", "mergeCommit": None})),
-    )
+def test_resolve_revert_target_pr_number_missing_merge_commit_returns_none(mod, fake_forge, repo):
+    fake_forge(pr_view=mod.forge_lib.ForgeResult(
+        0, data={"state": "MERGED", "mergeCommit": None}
+    ))
     assert mod.resolve_revert_target("42") is None
 
 
-def test_resolve_revert_target_pr_number_without_gh_installed_returns_none(mod, monkeypatch, repo):
-    gh_calls = []
-    monkeypatch.setattr(mod, "require_gh", lambda: False)
-    monkeypatch.setattr(mod, "gh", lambda args: gh_calls.append(args))
+def test_resolve_revert_target_pr_number_without_forge_available_returns_none(mod, fake_forge, repo):
+    forge = fake_forge(available=False)
 
     assert mod.resolve_revert_target("42") is None
-    assert gh_calls == []
+    assert forge.calls == []
 
 
-# --- fetch_live_acme_snapshot regression test (TOOL-5) --------------------
+# --- fetch_live_acme_snapshot regression test ------------------------------
 
 _LIVE_SNAPSHOT_JS = """var CF = NewDnsProvider("cloudflare");
 var REG = NewRegistrar("none");
@@ -193,7 +177,7 @@ D("example.com", REG,
 
 
 def test_fetch_live_acme_snapshot_parses_get_zones_output_without_error(mod, monkeypatch):
-    """Regression test for TOOL-5: fetch_live_acme_snapshot used to call the
+    """Regression test: fetch_live_acme_snapshot used to call the
     unqualified name find_zone_block_in_lines(...) instead of
     records.find_zone_block_in_lines(...), raising NameError before it ever
     got to parse anything."""
